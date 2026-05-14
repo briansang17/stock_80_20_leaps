@@ -6,29 +6,41 @@ Runs all 10 winning strategies daily and sends ONE email per day when any
 of them fire.  The email lists which strategy(ies) flagged, why (each
 condition with current values), and the exact LEAPS contract to buy.
 
-Strategies monitored (+15% OTM 2-yr LEAPS, rotation model):
-  1. D_BREAKOUT       — 60d high + SPY>200DMA + VIX<20         (8.1/yr)
-  2. M_QUAL_BREAKOUT  — 60d high + VIX<18 + SPY>50DMA>200DMA   (5.8/yr)
-  3. F_VIX_CRUSH      — VIX dropped 30%+ in 10d + SPY>200DMA   (2.8/yr)
-  4. C_CHEAP_IV       — VIX<16 + SPY>50DMA + RSI 40-65         (8.0/yr)
-  5. H_TREND_FOLLOW   — SPY>50DMA>200DMA + MACD>0 + RSI<65     (11.6/yr)
-  6. L_A_OR_SQUEEZE   — A_CURRENT OR BB_SQUEEZE                (4.3/yr)
-  7. I_BB_SQUEEZE     — BB<20% + breakout + SPY>200DMA + VIX<22 (2.3/yr)
-  8. A_CURRENT        — 2-of-3 momentum + filters              (2.3/yr)
-  9. N_FILTER_CURR    — A_CURRENT + extra filters              (1.6/yr)
- 10. E_OVERSOLD       — RSI<35 + SPY>200DMA + VIX<28           (2.8/yr)
+Strategies are ordered by **10-year after-tax edge** (biggest $$ first)
+and **renamed A→J to match the rank** (A_ = best, J_ = worst).
+Win rate and edge figures come from `FINAL_STRATEGY.md` backtests
+(+15% OTM 2-yr LEAPS, rotation model, 2016-2026 SPY+VIX).
+
+    Rank  Strategy           Win%   10yr edge $   Fires/yr  Idea
+    ────  ─────────────────  ────   ───────────   ────────  ──────────────────
+     1.   A_CHEAP_IV         82%    +$390,073      8.0      VIX<16 + RSI sweet spot
+     2.   B_TREND_FOLLOW     74%    +$378,454     11.6      50>200DMA + MACD>0
+     3.   C_BREAKOUT         81%    +$372,959      8.1      New 60-day high
+     4.   D_QUAL_BREAKOUT    79%    +$341,693      5.8      Breakout + VIX<18
+     5.   E_A_OR_SQUEEZE     77%    +$181,197      4.3      Momentum OR squeeze
+     6.   F_VIX_CRUSH        68%    +$132,260      2.8      VIX -30% in 10d
+     7.   G_BB_SQUEEZE       78%    +$114,301      2.3      BB squeeze breakout
+     8.   H_CURRENT          70%     +$64,727      2.3      2-of-3 momentum
+     9.   I_FILTER_CURR      75%     +$63,826      1.6      H_CURRENT + extra filters
+    10.   J_OVERSOLD         71%     +$58,465      2.8      RSI<35 in uptrend
+
+Historical scan default: 1,260 trading days ≈ 5 years.
 
 Usage:
-  python daily_signal_top10.py                # check & maybe email
+  python daily_signal_top10.py                # check, email if fires, 5y scan
   python daily_signal_top10.py --force        # email even with no fires
   python daily_signal_top10.py --quiet        # just print, no email
   python daily_signal_top10.py --otm 0.15     # change OTM target (default 15%)
+  python daily_signal_top10.py --scan 252     # use 1-year scan instead of 5y
+  python daily_signal_top10.py --scan 0       # disable historical scan
 """
 
 from __future__ import annotations
 import argparse, json, sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 import pandas as pd
 import numpy as np
 
@@ -57,37 +69,59 @@ DEBOUNCE_STATE_PATH = PROJECT_DIR / ".strategy_debounce.json"
 DEFAULT_OTM = 0.15
 DEBOUNCE_DAYS = 1            # only suppress same-day duplicates per strategy
 HIGH_CONVICTION_FRESH = 3    # ≥3 fresh fires same day = "🔥 HIGH CONVICTION"
+DEFAULT_SCAN_DAYS = 1260     # past N trading days scanned for HC days (~5 years)
 
-STRATEGIES = [
-    # (key, rule, freq/yr, layman description)
-    ("D_BREAKOUT",      rule_D_breakout,         8.1,
-     "SPY hit new 60-day high with VIX still low"),
-    ("M_QUAL_BREAKOUT", rule_M_quality_breakout, 5.8,
-     "Quality breakout: 60d high + very low VIX + clean uptrend"),
-    ("F_VIX_CRUSH",     rule_F_vix_crush,        2.8,
-     "Fear collapsed: VIX dropped 30%+ in 10 days"),
-    ("C_CHEAP_IV",      rule_C_cheap_iv,         8.0,
-     "Options are cheap (VIX<16) and trend intact"),
-    ("H_TREND_FOLLOW",  rule_H_trend_follow,    11.6,
-     "Trending uptrend with MACD bullish"),
-    ("L_A_OR_SQUEEZE",  rule_L_squeeze_or_current, 4.3,
-     "Momentum entry OR Bollinger squeeze breakout"),
-    ("I_BB_SQUEEZE",    rule_I_bb_squeeze,       2.3,
-     "Bollinger Band squeeze + breakout"),
-    ("A_CURRENT",       rule_A_current,          2.3,
-     "2-of-3 momentum signals fired + filters pass"),
-    ("N_FILTER_CURR",   rule_N_filter_current,   1.6,
-     "Strict momentum entry (A_CURRENT + extra filters)"),
-    ("E_OVERSOLD",      rule_E_oversold_uptrend, 2.8,
-     "Oversold dip in established uptrend (RSI<35)"),
+
+@dataclass(frozen=True)
+class StrategyDef:
+    """One backtested entry strategy, with its historical performance figures."""
+    key: str            # internal short name (D_BREAKOUT, C_CHEAP_IV, ...)
+    rule: Callable      # row -> bool decision function (from strategy_alternatives)
+    freq_yr: float      # average fires per year (10-yr backtest)
+    win_rate: int       # historical win % at +15% OTM 2-yr LEAPS
+    edge_10yr: int      # after-tax $$ edge over pure VOO DCA, 10-yr
+    layman: str         # plain-English description for the email body
+
+
+# Ordered by 10-year after-tax edge (biggest $$ first).  Public keys are
+# renamed A→J so the prefix letter matches the rank (A_=best, J_=worst).
+# The python rule_* function names from strategy_alternatives.py are kept
+# intact (they are internal-only).
+# Numbers from FINAL_STRATEGY.md  ($2,500/mo VOO DCA + rotation model).
+STRATEGIES: list[StrategyDef] = [
+    StrategyDef("A_CHEAP_IV",       rule_C_cheap_iv,           8.0, 82, 390_073,
+                "Options are cheap (VIX<16) and trend intact"),
+    StrategyDef("B_TREND_FOLLOW",   rule_H_trend_follow,      11.6, 74, 378_454,
+                "Trending uptrend with MACD bullish"),
+    StrategyDef("C_BREAKOUT",       rule_D_breakout,           8.1, 81, 372_959,
+                "SPY hit new 60-day high with VIX still low"),
+    StrategyDef("D_QUAL_BREAKOUT",  rule_M_quality_breakout,   5.8, 79, 341_693,
+                "Quality breakout: 60d high + very low VIX + clean uptrend"),
+    StrategyDef("E_A_OR_SQUEEZE",   rule_L_squeeze_or_current, 4.3, 77, 181_197,
+                "Momentum entry (H_CURRENT) OR Bollinger squeeze breakout"),
+    StrategyDef("F_VIX_CRUSH",      rule_F_vix_crush,          2.8, 68, 132_260,
+                "Fear collapsed: VIX dropped 30%+ in 10 days"),
+    StrategyDef("G_BB_SQUEEZE",     rule_I_bb_squeeze,         2.3, 78, 114_301,
+                "Bollinger Band squeeze + breakout"),
+    StrategyDef("H_CURRENT",        rule_A_current,            2.3, 70,  64_727,
+                "2-of-3 momentum signals fired + filters pass"),
+    StrategyDef("I_FILTER_CURR",    rule_N_filter_current,     1.6, 75,  63_826,
+                "Strict momentum entry (H_CURRENT + extra VIX/MACD filters)"),
+    StrategyDef("J_OVERSOLD",       rule_E_oversold_uptrend,   2.8, 71,  58_465,
+                "Oversold dip in established uptrend (RSI<35)"),
 ]
 
 
 # ─── Data ────────────────────────────────────────────────────────────────────
 
-def fetch_data(period_days: int = 500) -> pd.DataFrame:
-    """Fetch SPY + VIX from Yahoo (need ≥252 days for BB percentile)."""
-    print(f"  📡 Fetching SPY + VIX from Yahoo Finance...")
+def fetch_data(scan_days: int = 0) -> pd.DataFrame:
+    """Fetch SPY + VIX from Yahoo Finance.
+
+    Need ≥252 days for BB-percentile + an extra buffer for whatever
+    --scan window the user requested.
+    """
+    period_days = max(500, 380 + int(scan_days * 1.5))   # ~1.5 cal/trading
+    print(f"  📡 Fetching SPY + VIX from Yahoo Finance ({period_days}d)...")
     end = pd.Timestamp.today() + pd.Timedelta(days=1)
     start = end - pd.Timedelta(days=period_days)
     spy = yf.download("SPY",  start=start, end=end, progress=False, auto_adjust=False)
@@ -119,7 +153,7 @@ def explain_rule(key: str, row, sigs_row) -> tuple[bool, list[str]]:
     spy = row["SPY"]
     vix = row["VIX"]
 
-    if key == "D_BREAKOUT":
+    if key == "C_BREAKOUT":
         c1 = spy >= row["high60"]
         c2 = bool(row["spy_above_200"])
         c3 = vix < 20
@@ -130,7 +164,7 @@ def explain_rule(key: str, row, sigs_row) -> tuple[bool, list[str]]:
         ]
         return (c1 and c2 and c3), conds
 
-    if key == "M_QUAL_BREAKOUT":
+    if key == "D_QUAL_BREAKOUT":
         c1 = bool(row["is_new_high60"])
         c2 = vix < 18
         c3 = bool(row["spy_above_50"])
@@ -152,7 +186,7 @@ def explain_rule(key: str, row, sigs_row) -> tuple[bool, list[str]]:
         ]
         return c1 and c2, conds
 
-    if key == "C_CHEAP_IV":
+    if key == "A_CHEAP_IV":
         c1 = vix < 16
         c2 = bool(row["spy_above_50"])
         c3 = 40 <= row["RSI14"] <= 65
@@ -163,7 +197,7 @@ def explain_rule(key: str, row, sigs_row) -> tuple[bool, list[str]]:
         ]
         return all([c1, c2, c3]), conds
 
-    if key == "H_TREND_FOLLOW":
+    if key == "B_TREND_FOLLOW":
         c1 = bool(row["spy_above_50"])
         c2 = row["sma50"] > row["sma200"]
         c3 = row["macd"] > 0
@@ -176,19 +210,19 @@ def explain_rule(key: str, row, sigs_row) -> tuple[bool, list[str]]:
         ]
         return all([c1, c2, c3, c4]), conds
 
-    if key == "L_A_OR_SQUEEZE":
-        # Either rule_A_current OR rule_I_bb_squeeze
-        a_fired, a_conds = explain_rule("A_CURRENT", row, sigs_row)
-        i_fired, i_conds = explain_rule("I_BB_SQUEEZE", row, sigs_row)
+    if key == "E_A_OR_SQUEEZE":
+        # Either H_CURRENT (momentum) OR G_BB_SQUEEZE fires
+        a_fired, a_conds = explain_rule("H_CURRENT", row, sigs_row)
+        i_fired, i_conds = explain_rule("G_BB_SQUEEZE", row, sigs_row)
         conds = [
-            f"{'✅' if a_fired else '❌'} Branch 1 — A_CURRENT fires",
+            f"{'✅' if a_fired else '❌'} Branch 1 — H_CURRENT fires",
             *[f"    {c}" for c in a_conds],
-            f"{'✅' if i_fired else '❌'} Branch 2 — I_BB_SQUEEZE fires",
+            f"{'✅' if i_fired else '❌'} Branch 2 — G_BB_SQUEEZE fires",
             *[f"    {c}" for c in i_conds],
         ]
         return a_fired or i_fired, conds
 
-    if key == "I_BB_SQUEEZE":
+    if key == "G_BB_SQUEEZE":
         c1 = row["bb_width_pct"] < 0.20
         c2 = spy >= row["bb_upper"]
         c3 = bool(row["spy_above_200"])
@@ -201,7 +235,7 @@ def explain_rule(key: str, row, sigs_row) -> tuple[bool, list[str]]:
         ]
         return all([c1, c2, c3, c4]), conds
 
-    if key == "A_CURRENT":
+    if key == "H_CURRENT":
         score = int(sigs_row.get("score", 0))
         c1 = score >= 2
         c2 = bool(row["spy_above_200"])
@@ -216,21 +250,21 @@ def explain_rule(key: str, row, sigs_row) -> tuple[bool, list[str]]:
         ]
         return all([c1, c2, c3, c4]), conds
 
-    if key == "N_FILTER_CURR":
-        a_fired, _ = explain_rule("A_CURRENT", row, sigs_row)
+    if key == "I_FILTER_CURR":
+        a_fired, _ = explain_rule("H_CURRENT", row, sigs_row)
         c1 = a_fired
         c2 = row["vix_30d_mean"] < 22
         c3 = row["macd"] > 0
         c4 = bool(row["spy_above_50"])
         conds = [
-            cv("A_CURRENT fires",     c1, ""),
+            cv("H_CURRENT fires",     c1, ""),
             cv("VIX 30d avg < 22",    c2, f"{row['vix_30d_mean']:.1f}"),
             cv("MACD > 0",            c3, f"MACD {row['macd']:+.2f}"),
             cv("SPY > 50DMA",         c4, f"50DMA ${row['sma50']:.0f}"),
         ]
         return all([c1, c2, c3, c4]), conds
 
-    if key == "E_OVERSOLD":
+    if key == "J_OVERSOLD":
         c1 = row["RSI14"] < 35
         c2 = bool(row["spy_above_200"])
         c3 = vix < 28
@@ -288,7 +322,14 @@ def save_debounce_state(state: dict):
     DEBOUNCE_STATE_PATH.write_text(json.dumps(state, default=str))
 
 
-def build_report(df: pd.DataFrame, otm_pct: float, mode: str = "DEBOUNCED") -> dict:
+def build_report(df: pd.DataFrame, otm_pct: float, mode: str = "DEBOUNCED",
+                 scan_days: int = 0) -> dict:
+    """Build the daily report dict.
+
+    If `scan_days > 0`, also replay the past `scan_days` trading days and
+    attach a `history` entry so HIGH-CONVICTION days are visible alongside
+    today's fires.
+    """
     feats = extend_features(df)
     sigs  = signals_in_window(feats, 1)
     today = feats.index[-1]
@@ -302,22 +343,24 @@ def build_report(df: pd.DataFrame, otm_pct: float, mode: str = "DEBOUNCED") -> d
     today_ts = today
 
     fires = []
-    fresh_fires = []   # strategies that are FRESH (not within 14d of last fire)
-    for key, rule, freq, layman in STRATEGIES:
-        fired, conds = explain_rule(key, row, sigs_row)
+    fresh_fires = []   # strategies that are FRESH (not within DEBOUNCE_DAYS of last fire)
+    for s in STRATEGIES:
+        fired, conds = explain_rule(s.key, row, sigs_row)
         is_fresh = True
         if fired and mode == "DEBOUNCED":
-            last = debounce_state.get(key)
+            last = debounce_state.get(s.key)
             if last:
                 last_dt = pd.Timestamp(last)
                 if (today_ts - last_dt).days < DEBOUNCE_DAYS:
                     is_fresh = False
         fires.append({
-            "key": key, "fired": fired, "freq": freq, "layman": layman,
-            "conds": conds, "is_fresh": fired and is_fresh,
+            "key": s.key, "fired": fired, "freq": s.freq_yr,
+            "win_rate": s.win_rate, "edge_10yr": s.edge_10yr,
+            "layman": s.layman, "conds": conds,
+            "is_fresh": fired and is_fresh,
         })
         if fired and is_fresh:
-            fresh_fires.append(key)
+            fresh_fires.append(s.key)
 
     contract = suggest_contract(spy, vix, otm_pct)
 
@@ -334,6 +377,8 @@ def build_report(df: pd.DataFrame, otm_pct: float, mode: str = "DEBOUNCED") -> d
         any_actionable = n_fresh > 0
 
     is_high_conviction = n_fresh >= HIGH_CONVICTION_FRESH
+
+    history = build_history_scan(feats, sigs, scan_days) if scan_days > 0 else None
 
     return {
         "date": str(today.date()),
@@ -352,6 +397,7 @@ def build_report(df: pd.DataFrame, otm_pct: float, mode: str = "DEBOUNCED") -> d
         "n_fires": n_fires,
         "n_fresh": n_fresh,
         "contract": contract,
+        "history": history,
     }
 
 
@@ -420,23 +466,29 @@ def format_text_report(r: dict) -> str:
         out.append(f"     ⚠️  Skip if SPY gaps down >1.5%, FOMC day, or major data release morning of")
         out.append("")
 
-    for f in r["fires"]:
-        if f["fired"]:
-            tag = "🟢" if f["is_fresh"] else "⏸️ "
-            note = " ✅ FRESH" if f["is_fresh"] else " (within 14d cooldown — already alerted)"
-            out.append(f"  {tag} {f['key']:<18} ({f['freq']:.1f}/yr){note}")
-            out.append(f"     {f['layman']}")
-            for c in f["conds"]:
-                out.append(f"       {c}")
-            out.append("")
+    # Strategies sorted best-first inside each (fired / not-fired) group.
+    fired = sorted([f for f in r["fires"] if f["fired"]],
+                   key=lambda f: -f["edge_10yr"])
+    for f in fired:
+        tag = "🟢" if f["is_fresh"] else "⏸️ "
+        note = (" ✅ FRESH" if f["is_fresh"]
+                else f" (within {DEBOUNCE_DAYS}d cooldown — already alerted)")
+        out.append(f"  {tag} {f['key']:<18} ({f['freq']:.1f}/yr  •  "
+                   f"win {f['win_rate']}%  •  10yr edge ${f['edge_10yr']:+,}){note}")
+        out.append(f"     {f['layman']}")
+        for c in f["conds"]:
+            out.append(f"       {c}")
+        out.append("")
 
-    not_fired = [f for f in r["fires"] if not f["fired"]]
+    not_fired = sorted([f for f in r["fires"] if not f["fired"]],
+                       key=lambda f: -f["edge_10yr"])
     if not_fired:
         out.append("  ── Not firing today (full condition breakdown) ──")
         out.append("")
         for f in not_fired:
             failed = [c for c in f["conds"] if c.startswith("❌")]
-            out.append(f"  🔴 {f['key']:<18} ({f['freq']:.1f}/yr) — "
+            out.append(f"  🔴 {f['key']:<18} ({f['freq']:.1f}/yr  •  "
+                       f"win {f['win_rate']}%  •  10yr edge ${f['edge_10yr']:+,}) — "
                        f"{len(failed)} of {len(f['conds'])} conditions failed")
             out.append(f"     {f['layman']}")
             for c in f["conds"]:
@@ -444,12 +496,122 @@ def format_text_report(r: dict) -> str:
             out.append("")
 
     out.append("")
+    out.append(format_strategy_ranking())
+    out.append("")
+    if r.get("history") is not None:
+        out.append(format_history_scan(r["history"]))
+        out.append("")
     out.append("═" * 72)
     return "\n".join(out)
 
 
+def format_strategy_ranking() -> str:
+    """Compact ranking table for the 10 strategies, biggest 10-yr $$ edge first."""
+    lines = []
+    lines.append("  ── STRATEGY RANKING (sorted by 10-yr after-tax edge — biggest $$ first) ──")
+    lines.append("")
+    lines.append(f"     {'#':>2}  {'Strategy':<17}  {'Win%':>4}  "
+                 f"{'10yr edge':>12}  {'Fires/yr':>8}  Idea")
+    lines.append("     " + "─" * 100)
+    ranked = sorted(STRATEGIES, key=lambda s: -s.edge_10yr)
+    for i, s in enumerate(ranked, 1):
+        lines.append(f"     {i:>2}.  {s.key:<17}  {s.win_rate:>3}%  "
+                     f"${s.edge_10yr:>+10,}  {s.freq_yr:>7.1f}  {s.layman}")
+    return "\n".join(lines)
+
+
+def format_history_scan(history: dict) -> str:
+    """Format the past-N-day scan: list of high-conviction days + strategy
+    contributions during that window."""
+    lines = []
+    lines.append(f"  ── HISTORICAL SCAN — past {history['days']} trading days "
+                 f"(real data {history['start']} → {history['end']}) ──")
+    lines.append("")
+
+    hc_days = history["hc_days"]
+    if not hc_days:
+        lines.append(f"     ⚠️  No HIGH-CONVICTION days "
+                     f"(≥{HIGH_CONVICTION_FRESH} strategies same day) in this window.")
+    else:
+        lines.append(f"     🔥 {len(hc_days)} HIGH-CONVICTION day"
+                     f"{'s' if len(hc_days) != 1 else ''} "
+                     f"(≥{HIGH_CONVICTION_FRESH} strategies firing same day):")
+        lines.append("")
+        lines.append(f"        {'Date':<11}  {'SPY':>7}  {'VIX':>5}  "
+                     f"{'#':>2}  Strategies that agreed")
+        lines.append("        " + "─" * 92)
+        for d in hc_days:
+            lines.append(f"        {d['date']:<11}  ${d['spy']:>6,.0f}  "
+                         f"{d['vix']:>4.1f}  {d['n']:>2}  {', '.join(d['fired'])}")
+
+    # Per-strategy fire counts across the scan window
+    lines.append("")
+    lines.append(f"     Fire counts (any-day, past {history['days']} trading days):")
+    lines.append("")
+    lines.append(f"        {'#':>2}  {'Strategy':<17}  {'Fires':>5}  {'HC contrib':>10}  Bar")
+    lines.append("        " + "─" * 80)
+    counts = history["fire_counts"]
+    hc_credit = history["hc_credit"]
+    ranked = sorted(STRATEGIES, key=lambda s: -counts.get(s.key, 0))
+    max_fires = max(counts.values()) if counts else 1
+    for i, s in enumerate(ranked, 1):
+        n = counts.get(s.key, 0)
+        hc = hc_credit.get(s.key, 0)
+        bar = "█" * int(n / max(max_fires, 1) * 25)
+        lines.append(f"        {i:>2}.  {s.key:<17}  {n:>5}  {hc:>10}  {bar}")
+    return "\n".join(lines)
+
+
+def build_history_scan(feats: pd.DataFrame, sigs: pd.DataFrame,
+                       days: int) -> dict:
+    """Replay all 10 strategies for the last `days` trading days and
+    return a summary suitable for printing.
+
+    Detects which days were HIGH CONVICTION (≥3 strategies firing same day)
+    and tallies per-strategy fire counts + HC-contribution counts.
+
+    This is what surfaced the April 8 buy (3 strategies agreed: F_VIX_CRUSH,
+    L_A_OR_SQUEEZE, A_CURRENT).
+    """
+    window = feats.iloc[-days:]
+    hc_days = []
+    fire_counts: dict[str, int] = {s.key: 0 for s in STRATEGIES}
+    hc_credit:   dict[str, int] = {s.key: 0 for s in STRATEGIES}
+
+    for date, row in window.iterrows():
+        sigs_row = sigs.loc[date] if date in sigs.index else pd.Series({"score": 0})
+        fired_today = []
+        for s in STRATEGIES:
+            try:
+                f, _ = explain_rule(s.key, row, sigs_row)
+                if f:
+                    fired_today.append(s.key)
+                    fire_counts[s.key] += 1
+            except (KeyError, TypeError):
+                pass
+        if len(fired_today) >= HIGH_CONVICTION_FRESH:
+            hc_days.append({
+                "date":  str(date.date()),
+                "spy":   float(row["SPY"]),
+                "vix":   float(row["VIX"]),
+                "n":     len(fired_today),
+                "fired": fired_today,
+            })
+            for k in fired_today:
+                hc_credit[k] += 1
+
+    return {
+        "days":  len(window),
+        "start": str(window.index[0].date()),
+        "end":   str(window.index[-1].date()),
+        "hc_days":     hc_days,
+        "fire_counts": fire_counts,
+        "hc_credit":   hc_credit,
+    }
+
+
 def format_email_report(r: dict) -> tuple[str, str]:
-    """Returns (subject, body) for email."""
+    """Returns (subject, body) for email — concise, action-first."""
     if r["any_actionable"]:
         n = r["n_fresh"] if r["mode"] != "RAW" else r["n_fires"]
         fired_keys = ", ".join(r["fresh_fires"] if r["mode"] != "RAW"
@@ -460,8 +622,107 @@ def format_email_report(r: dict) -> tuple[str, str]:
             subject = f"🟢 SPY LEAPS — {n} signal{'s' if n != 1 else ''} firing ({fired_keys})"
     else:
         subject = f"⚪️ SPY LEAPS — no fresh signals today ({r['date']})"
-    body = format_text_report(r)
+    body = format_email_body(r)
     return subject, body
+
+
+def format_email_body(r: dict) -> str:
+    """Concise email body — only what's needed to act today.
+
+    Layout:
+      1. Verdict line + market snapshot (compact)
+      2. Action block (contract + 5-step execution) if any_actionable
+      3. Fired strategies with reasons (just the failed/passed conditions)
+      4. Strategy ranking (10-line table)
+      5. Recent HIGH-CONVICTION days (last 5 from history, if any)
+      6. Footer with usage hints
+    """
+    out: list[str] = []
+    out.append("═" * 72)
+    out.append(f"  SPY LEAPS — DAILY SIGNAL  •  {r['date']}")
+    out.append("═" * 72)
+    out.append("")
+
+    # ── 1. Verdict + market snapshot ─────────────────────────────────────────
+    if r["is_high_conviction"]:
+        verdict = f"🔥 HIGH CONVICTION BUY — {r['n_fresh']} strategies agree"
+    elif r["any_actionable"]:
+        verdict = f"🟢 BUY — {r['n_fresh']} fresh signal{'s' if r['n_fresh'] != 1 else ''} firing"
+    else:
+        verdict = "⚪️ NO ACTION — no fresh buy signals today"
+    out.append(f"  {verdict}")
+    out.append(f"  SPY ${r['spy']:.2f}  •  VIX {r['vix']:.1f}  •  "
+               f"RSI {r['rsi14']:.0f}  •  50DMA ${r['sma50']:.0f}  •  "
+               f"200DMA ${r['sma200']:.0f}  •  DD {r['drawdown']:+.1f}%")
+    out.append("")
+
+    # ── 2. Action block (only when actionable) ───────────────────────────────
+    if r["any_actionable"]:
+        c = r["contract"]
+        spy_now = r["spy"]
+        out.append("  " + "─" * 68)
+        out.append(f"  🟢 SUGGESTED CONTRACT (+{c['otm_pct']*100:.0f}% OTM 2-yr LEAPS)")
+        out.append(f"     Strike      : ${c['strike']:.0f}     "
+                   f"Expiry: {c['expiry']}")
+        out.append(f"     Mid premium : ${c['premium_mid']:.2f}/share     "
+                   f"Cost: ${c['cost']:.0f}/contract  (limit ≤ ${c['premium_ask']:.2f})")
+        out.append("")
+        out.append(f"  📌 TOMORROW MORNING EXECUTION:")
+        out.append(f"     1. At 9:30am ET, look up SPY current price")
+        out.append(f"     2. Strike = SPY × 1.15, round to $5 "
+                   f"(tonight ${spy_now:.0f} → "
+                   f"${round(spy_now*1.15/5)*5:.0f})")
+        out.append(f"     3. Wait until ~9:45am ET for spreads to tighten")
+        out.append(f"     4. Sell ~{int(c['cost']/spy_now*1.18) + 1} shares VOO "
+                   f"(specific-lot, prefer loss/long-term lots)")
+        out.append(f"     5. BUY 1 SPY ${c['strike']:.0f} {c['expiry']} call, "
+                   f"LIMIT ≤ mid + $0.10")
+        out.append(f"     ⚠️  Skip if SPY gaps down >1.5%, FOMC day, or major data release")
+        out.append("  " + "─" * 68)
+        out.append("")
+
+    # ── 3. Fired strategies with reasons ─────────────────────────────────────
+    fired = sorted([f for f in r["fires"] if f["fired"]],
+                   key=lambda f: -f["edge_10yr"])
+    if fired:
+        out.append(f"  ── WHY ({len(fired)} firing) ──")
+        for f in fired:
+            tag = "🟢" if f["is_fresh"] else "⏸️ "
+            tail = " (FRESH)" if f["is_fresh"] else f" (within {DEBOUNCE_DAYS}d cooldown)"
+            out.append(f"  {tag} {f['key']:<17} "
+                       f"win {f['win_rate']}%, 10yr edge ${f['edge_10yr']:+,}{tail}")
+            out.append(f"     {f['layman']}")
+            for c in f["conds"]:
+                out.append(f"       {c}")
+        out.append("")
+
+    # ── 4. Strategy ranking (always) ─────────────────────────────────────────
+    out.append("  ── STRATEGY RANKING (10-yr after-tax edge, biggest $$ first) ──")
+    ranked = sorted(STRATEGIES, key=lambda s: -s.edge_10yr)
+    fired_keys = {f["key"] for f in r["fires"] if f["fired"]}
+    for i, s in enumerate(ranked, 1):
+        flag = "🟢" if s.key in fired_keys else "  "
+        out.append(f"     {flag} {i:>2}. {s.key:<17}  win {s.win_rate}%  "
+                   f"10yr ${s.edge_10yr:>+9,}  ({s.freq_yr:.1f}/yr)")
+    out.append("")
+
+    # ── 5. Recent HIGH-CONVICTION days (last 5 from history) ─────────────────
+    hist = r.get("history")
+    if hist and hist["hc_days"]:
+        recent_hc = hist["hc_days"][-5:]
+        out.append(f"  ── RECENT 🔥 HIGH-CONVICTION DAYS "
+                   f"(past {hist['days']}d, {len(hist['hc_days'])} total) ──")
+        for d in recent_hc:
+            out.append(f"     {d['date']}  SPY ${d['spy']:>4.0f}  VIX {d['vix']:>4.1f}  "
+                       f"{d['n']} agreed: {', '.join(d['fired'])}")
+        out.append("")
+
+    # ── 6. Footer ────────────────────────────────────────────────────────────
+    out.append("─" * 72)
+    out.append("  Run `python final_leaps/daily_signal_top10.py --force` for full")
+    out.append("  diagnostics (all 10 strategies' condition breakdowns + 5-yr scan).")
+    out.append("─" * 72)
+    return "\n".join(out)
 
 
 def should_notify_again(r: dict) -> bool:
@@ -513,10 +774,14 @@ def main():
                         default="DEBOUNCED",
                         help="Notification filter mode (default DEBOUNCED, ~43 emails/yr; "
                              "RAW ~151/yr, HIGH_CONVICTION ~10/yr)")
+    parser.add_argument("--scan",  type=int, default=DEFAULT_SCAN_DAYS,
+                        help=f"Scan past N trading days for HIGH-CONVICTION days "
+                             f"(default {DEFAULT_SCAN_DAYS}; pass 0 to disable)")
     args = parser.parse_args()
 
-    df = fetch_data()
-    report = build_report(df, otm_pct=args.otm, mode=args.mode)
+    df = fetch_data(scan_days=args.scan)
+    report = build_report(df, otm_pct=args.otm, mode=args.mode,
+                          scan_days=args.scan)
     text = format_text_report(report)
     print(text)
     append_log(report)

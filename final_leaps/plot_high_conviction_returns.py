@@ -1,0 +1,372 @@
+"""
+HIGH-CONVICTION LEAPS — back-test + chart
+==========================================
+
+Walks every HIGH-CONVICTION day in the past 10 years (≥3 of the 10
+strategies firing same day) and simulates buying one +15% OTM 2-year
+SPY LEAPS call on each.  Each trade is priced day-by-day with the same
+Black-Scholes model and exit rules used by the production system.
+
+Output:
+  • Multi-panel PNG saved to `final_leaps/graphs/high_conviction_returns.png`
+  • Per-trade CSV saved to `final_leaps/graphs/high_conviction_trades.csv`
+  • Console summary (win rate, avg gain, total $$, best / worst trade)
+
+Layout of the PNG:
+  Panel 1 (top)    SPY price with HC entry markers (green=win, red=loss)
+  Panel 2 (middle) Per-trade % gain bar chart
+  Panel 3 (bottom) Cumulative $ invested vs $ realized (equity curve)
+
+Example
+-------
+    cd /Users/briansang/Desktop/stock_80_20_leaps
+    python final_leaps/plot_high_conviction_returns.py
+    python final_leaps/plot_high_conviction_returns.py --years 5
+    python final_leaps/plot_high_conviction_returns.py --per-lot 10000
+"""
+
+from __future__ import annotations
+import argparse
+from pathlib import Path
+
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")           # headless backend — must be set before pyplot import
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from tqdm import tqdm
+
+from strategy_backtest import (
+    load_data, signals_in_window, bs_call,
+    RISK_FREE_RATE, LEAPS_YEARS, COMMISSION_PER_CONTRACT,
+    EXIT_DD_50DMA, EXIT_VIX_HIGH, EXIT_VIX_SLOPE, EXIT_NEAR_EXP,
+)
+from strategy_alternatives import extend_features
+from daily_signal_top10 import STRATEGIES, explain_rule, HIGH_CONVICTION_FRESH
+
+
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+CONFIG = {
+    "otm_pct":         0.15,          # 15% out-of-the-money strike
+    "min_hold_days":   180,           # safety rules can't fire before 180d
+    "max_hold_days":   500,           # force-exit after 500d
+    "debounce_days":   14,            # min days between HC entries
+    "per_lot":         7_500,         # $ deployed per HC entry
+    "default_years":   10,
+    "output_chart":    "graphs/high_conviction_returns.png",
+    "output_csv":      "graphs/high_conviction_trades.csv",
+    "hc_threshold":    HIGH_CONVICTION_FRESH,   # ≥3 strategies same day
+}
+
+
+# ─── HC DAY DETECTION ────────────────────────────────────────────────────────
+
+def find_hc_days(feats: pd.DataFrame, sigs: pd.DataFrame,
+                 start: pd.Timestamp, end: pd.Timestamp) -> list[dict]:
+    """Scan [start, end] day-by-day, return every day where ≥`hc_threshold`
+    of the 10 strategies fired."""
+    window = feats.loc[start:end]
+    hc = []
+    for date, row in tqdm(window.iterrows(), total=len(window),
+                          desc="  Finding HC days", ncols=80):
+        sigs_row = sigs.loc[date] if date in sigs.index else pd.Series({"score": 0})
+        fired = []
+        for s in STRATEGIES:
+            try:
+                if explain_rule(s.key, row, sigs_row)[0]:
+                    fired.append(s.key)
+            except (KeyError, TypeError):
+                pass
+        if len(fired) >= CONFIG["hc_threshold"]:
+            hc.append({"date": date, "fired": fired, "n": len(fired)})
+    return hc
+
+
+# ─── TRADE SIMULATION ────────────────────────────────────────────────────────
+
+def _sigma_and_spread(row) -> tuple[float, float]:
+    """Pull IV + spread from the row (fall back to VIX/100 / 0.04 if missing)."""
+    sigma = (float(row["IV1Y_cal"])
+             if "IV1Y_cal" in row and pd.notna(row["IV1Y_cal"])
+             else float(row["VIX"]) / 100)
+    spread = (float(row["spread"])
+              if "spread" in row and pd.notna(row["spread"])
+              else 0.04)
+    return sigma, spread
+
+
+def simulate_trades(feats: pd.DataFrame, hc_days: list[dict]) -> pd.DataFrame:
+    """For each HC day, simulate buying ~$per_lot of +15% OTM LEAPS and
+    holding until our standard exit rule fires.  Returns one row per trade."""
+    trades = []
+    last_entry: pd.Timestamp | None = None
+
+    for hc in tqdm(hc_days, desc="  Simulating LEAPS", ncols=80):
+        date = hc["date"]
+        # 14-day debounce between any two HC entries (matches production rule)
+        if last_entry is not None and (date - last_entry).days < CONFIG["debounce_days"]:
+            continue
+
+        row = feats.loc[date]
+        spy = float(row["SPY"])
+        sigma, spread = _sigma_and_spread(row)
+        strike = round(spy * (1 + CONFIG["otm_pct"]) / 5) * 5
+        premium_ask = bs_call(spy, strike, LEAPS_YEARS, RISK_FREE_RATE, sigma) * (1 + spread / 2)
+        if premium_ask <= 0:
+            continue
+        contracts = max(int(CONFIG["per_lot"] / (premium_ask * 100)), 1)
+        cost = contracts * premium_ask * 100 + contracts * COMMISSION_PER_CONTRACT
+        expiry = date + pd.Timedelta(days=int(LEAPS_YEARS * 365))
+
+        # March forward until an exit rule fires
+        exit_date = exit_reason = None
+        exit_value = np.nan
+        future = feats.loc[date + pd.Timedelta(days=1):].index
+        for d in future:
+            r = feats.loc[d]
+            T_rem = max((expiry - d).days / 365.25, 1e-6)
+            s_now = float(r["SPY"])
+            sig_now, sp_now = _sigma_and_spread(r)
+            mark_bid = bs_call(s_now, strike, T_rem, RISK_FREE_RATE, sig_now) * (1 - sp_now / 2)
+            mtm = mark_bid * 100 * contracts
+            held = (d - date).days
+
+            sell, reason = False, ""
+            if T_rem <= EXIT_NEAR_EXP:
+                sell, reason = True, "Near expiry"
+            elif held >= CONFIG["max_hold_days"]:
+                sell, reason = True, "Max hold"
+            elif held >= CONFIG["min_hold_days"]:
+                if s_now < r["sma50"] * EXIT_DD_50DMA:
+                    sell, reason = True, "SPY broke 50DMA"
+                elif r["VIX"] > EXIT_VIX_HIGH:
+                    sell, reason = True, f"VIX>{EXIT_VIX_HIGH}"
+                elif r["vix_slope5"] > EXIT_VIX_SLOPE:
+                    sell, reason = True, f"VIX +{EXIT_VIX_SLOPE}/5d"
+            if sell:
+                exit_date, exit_reason = d, reason
+                exit_value = mtm - contracts * COMMISSION_PER_CONTRACT
+                break
+
+        # Still open at end of data → mark-to-market
+        if exit_date is None:
+            exit_date = feats.index[-1]
+            last = feats.iloc[-1]
+            T_rem = max((expiry - exit_date).days / 365.25, 1e-6)
+            sig_last, _ = _sigma_and_spread(last)
+            exit_value = bs_call(float(last["SPY"]), strike, T_rem,
+                                 RISK_FREE_RATE, sig_last) * 100 * contracts
+            exit_reason = "still open"
+
+        trades.append({
+            "entry_date":    date,
+            "exit_date":     exit_date,
+            "entry_spy":     spy,
+            "exit_spy":      float(feats.loc[exit_date, "SPY"]),
+            "strike":        strike,
+            "contracts":     contracts,
+            "cost":          cost,
+            "exit_value":    exit_value,
+            "pnl":           exit_value - cost,
+            "pct":           (exit_value - cost) / cost,
+            "held_days":     (exit_date - date).days,
+            "exit_reason":   exit_reason,
+            "n_strategies":  hc["n"],
+            "fired":         ", ".join(hc["fired"]),
+        })
+        last_entry = date
+
+    return pd.DataFrame(trades)
+
+
+# ─── SUMMARY ─────────────────────────────────────────────────────────────────
+
+def print_summary(trades: pd.DataFrame, years: float):
+    """Print a console summary of the back-test results."""
+    n = len(trades)
+    wins = (trades["pct"] > 0).sum()
+    losses = n - wins
+    total_invested = trades["cost"].sum()
+    total_realized = trades["exit_value"].sum()
+    net = total_realized - total_invested
+
+    print("\n" + "═" * 78)
+    print(f"  HIGH-CONVICTION LEAPS BACK-TEST  •  past {years:.1f} years")
+    print("═" * 78)
+    print(f"  HC entries     : {n} ({n/years:.1f}/yr)")
+    print(f"  Win rate       : {wins}/{n}  ({wins/max(n,1)*100:.0f}%)")
+    print(f"  Avg per trade  : {trades['pct'].mean()*100:+.1f}%")
+    print(f"  Median per trd : {trades['pct'].median()*100:+.1f}%")
+    print(f"  Best  / Worst  : {trades['pct'].max()*100:+.1f}%  /  "
+          f"{trades['pct'].min()*100:+.1f}%")
+    print(f"  Avg held       : {trades['held_days'].mean():.0f} days")
+    print(f"  Total invested : ${total_invested:>11,.0f}  ({n} entries × "
+          f"~${CONFIG['per_lot']:,}/each)")
+    print(f"  Total realized : ${total_realized:>11,.0f}")
+    print(f"  NET P&L        : ${net:>+11,.0f}  ({net/total_invested*100:+.1f}% on capital deployed)")
+    # Per-trade annualised — money is held ~`avg_days` per trade, so the
+    # annualised return per dollar deployed is (1+avg_pct) ^ (365/avg_days) - 1.
+    avg_days = trades['held_days'].mean()
+    avg_pct  = trades['pct'].mean()
+    if avg_days > 0 and avg_pct > -1:
+        ann_per_trade = ((1 + avg_pct) ** (365 / avg_days) - 1) * 100
+        print(f"  Annualized/trd : ~{ann_per_trade:+.1f}%/yr (per-trade, "
+              f"avg held {avg_days:.0f}d)")
+    if losses > 0:
+        worst = trades.nsmallest(3, "pct")
+        print(f"\n  Three worst trades:")
+        for t in worst.itertuples():
+            print(f"     {t.entry_date.date()} → {t.exit_date.date()}  "
+                  f"{t.pct*100:+5.1f}%  ({t.exit_reason})")
+    print("═" * 78)
+
+
+# ─── CHART ───────────────────────────────────────────────────────────────────
+
+def plot_results(feats: pd.DataFrame, trades: pd.DataFrame, out_path: Path):
+    """Build the three-panel summary chart."""
+    fig = plt.figure(figsize=(15, 11))
+    gs  = fig.add_gridspec(3, 1, height_ratios=[2.0, 1.0, 1.4], hspace=0.42)
+
+    win_rate = (trades["pct"] > 0).mean() * 100
+    avg_pct  = trades["pct"].mean() * 100
+    total_invested = trades["cost"].sum()
+    total_realized = trades["exit_value"].sum()
+    net = total_realized - total_invested
+
+    # Disable mathtext parsing in titles so '$' renders literally.
+    plt.rcParams["text.usetex"]    = False
+    plt.rcParams["mathtext.default"] = "regular"
+    title_dollars = f"\\${net:+,.0f} on \\${total_invested:,.0f}"
+    fig.suptitle(
+        f"SPY +15% OTM LEAPS bought on every HIGH-CONVICTION day  "
+        f"(≥{CONFIG['hc_threshold']} of 10 strategies agreeing)\n"
+        f"{len(trades)} trades  •  win rate {win_rate:.0f}%  •  "
+        f"avg trade {avg_pct:+.1f}%  •  net {title_dollars} deployed",
+        fontsize=13, fontweight="bold", y=0.995,
+    )
+
+    # ── Panel 1: SPY price with HC entry markers ─────────────────────────────
+    ax1 = fig.add_subplot(gs[0])
+    ax1.plot(feats.index, feats["SPY"], color="steelblue", lw=1.0, alpha=0.85,
+             label="SPY close")
+    wins = trades[trades["pct"] > 0]
+    losses = trades[trades["pct"] <= 0]
+    ax1.scatter(wins["entry_date"], wins["entry_spy"],
+                marker="^", s=70, c="#28a745", edgecolor="black",
+                linewidth=0.6, label=f"HC entry — WIN  ({len(wins)})", zorder=4)
+    ax1.scatter(losses["entry_date"], losses["entry_spy"],
+                marker="v", s=70, c="#dc3545", edgecolor="black",
+                linewidth=0.6, label=f"HC entry — LOSS ({len(losses)})", zorder=4)
+    ax1.set_ylabel("SPY price ($)")
+    ax1.set_title("SPY price with HIGH-CONVICTION LEAPS entries", fontsize=11)
+    ax1.legend(loc="upper left", fontsize=9)
+    ax1.grid(alpha=0.3)
+    ax1.xaxis.set_major_locator(mdates.YearLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    # ── Panel 2: per-trade % return bar chart ────────────────────────────────
+    ax2 = fig.add_subplot(gs[1])
+    colors = ["#28a745" if p > 0 else "#dc3545" for p in trades["pct"]]
+    bars = ax2.bar(trades["entry_date"], trades["pct"] * 100,
+                   color=colors, alpha=0.85, width=18)
+    ax2.axhline(0, color="black", lw=0.6)
+    ax2.axhline(avg_pct, color="navy", ls="--", lw=1.2,
+                label=f"Mean {avg_pct:+.1f}%")
+    ax2.set_ylabel("Trade return (%)")
+    ax2.set_title(f"Per-trade LEAPS return  •  win rate {win_rate:.0f}%  "
+                  f"•  best {trades['pct'].max()*100:+.0f}%  "
+                  f"•  worst {trades['pct'].min()*100:+.0f}%", fontsize=11)
+    ax2.legend(loc="upper left", fontsize=9)
+    ax2.grid(alpha=0.3, axis="y")
+    ax2.xaxis.set_major_locator(mdates.YearLocator())
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    # ── Panel 3: cumulative invested vs realized equity curve ────────────────
+    ax3 = fig.add_subplot(gs[2])
+    sorted_t = trades.sort_values("exit_date")
+    cum_invested = sorted_t["cost"].cumsum().values
+    cum_realized = sorted_t["exit_value"].cumsum().values
+    x_dates = sorted_t["exit_date"].values
+    ax3.plot(x_dates, cum_invested, color="gray", lw=1.4,
+             label=f"Total deployed   \\${cum_invested[-1]:,.0f}")
+    ax3.plot(x_dates, cum_realized, color="#28a745", lw=2.0,
+             label=f"Total realized   \\${cum_realized[-1]:,.0f}  "
+                   f"({(cum_realized[-1]/cum_invested[-1]-1)*100:+.0f}% on capital)")
+    ax3.fill_between(x_dates, cum_invested, cum_realized,
+                     where=(cum_realized >= cum_invested),
+                     color="#28a745", alpha=0.18, label="Profit zone")
+    ax3.fill_between(x_dates, cum_invested, cum_realized,
+                     where=(cum_realized <  cum_invested),
+                     color="#dc3545", alpha=0.18, label="Loss zone")
+    ax3.set_ylabel("$ cumulative")
+    ax3.set_title("Cumulative capital deployed vs realized (sorted by exit date)",
+                  fontsize=11)
+    ax3.legend(loc="upper left", fontsize=9)
+    ax3.grid(alpha=0.3)
+    ax3.xaxis.set_major_locator(mdates.YearLocator())
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    print(f"\n  💾 Saved chart: {out_path}")
+
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--years",   type=float, default=CONFIG["default_years"],
+                   help=f"Look-back in years (default {CONFIG['default_years']})")
+    p.add_argument("--per-lot", type=float, default=CONFIG["per_lot"],
+                   help=f"$ deployed per entry (default {CONFIG['per_lot']})")
+    p.add_argument("--otm",     type=float, default=CONFIG["otm_pct"],
+                   help=f"OTM percentage (default {CONFIG['otm_pct']})")
+    args = p.parse_args()
+
+    CONFIG["per_lot"] = args.per_lot
+    CONFIG["otm_pct"] = args.otm
+
+    print("\n" + "═" * 78)
+    print("  HIGH-CONVICTION LEAPS — back-test + chart")
+    print("═" * 78)
+    print(f"  Config:")
+    for k, v in CONFIG.items():
+        print(f"     {k:<18} {v}")
+
+    df    = load_data()
+    feats = extend_features(df)
+    sigs  = signals_in_window(feats, 1)
+
+    end_date   = feats.index[-1]
+    start_date = end_date - pd.Timedelta(days=int(365 * args.years))
+    print(f"\n  Period: {start_date.date()} → {end_date.date()}  "
+          f"({args.years:.1f} years)")
+
+    hc_days = find_hc_days(feats, sigs, start_date, end_date)
+    print(f"  Found {len(hc_days)} HC days "
+          f"(≥{CONFIG['hc_threshold']} strategies firing same day)")
+
+    if not hc_days:
+        print("  ⚠️  No HC days in window — exiting.")
+        return
+
+    trades = simulate_trades(feats, hc_days)
+    print(f"  After {CONFIG['debounce_days']}-day debounce: "
+          f"{len(trades)} unique LEAPS trades.")
+
+    print_summary(trades, args.years)
+
+    out_dir = Path(__file__).resolve().parent
+    csv_path = out_dir / CONFIG["output_csv"]
+    csv_path.parent.mkdir(exist_ok=True)
+    trades.to_csv(csv_path, index=False)
+    print(f"\n  💾 Saved trades CSV: {csv_path}")
+
+    plot_results(feats.loc[start_date:end_date], trades,
+                 out_dir / CONFIG["output_chart"])
+    print()
+
+
+if __name__ == "__main__":
+    main()

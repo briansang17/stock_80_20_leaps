@@ -6,11 +6,12 @@
     <string>com.briansang.leaps-signal</string>
 
     <!-- Run python with the project's virtual environment.
-         Now uses daily_signal_top10.py which scans ALL 10 top strategies. -->
+         Uses final_leaps/daily_signal_top10.py which scans all 10 strategies
+         AND a 5-yr (1260-day) high-conviction history. -->
     <key>ProgramArguments</key>
     <array>
         <string>/Users/briansang/Desktop/stock_80_20_leaps/.venv/bin/python</string>
-        <string>/Users/briansang/Desktop/stock_80_20_leaps/daily_signal_top10.py</string>
+        <string>/Users/briansang/Desktop/stock_80_20_leaps/final_leaps/daily_signal_top10.py</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -30,9 +31,9 @@
 
     <!-- Capture stdout/stderr for debugging -->
     <key>StandardOutPath</key>
-    <string>/Users/briansang/Desktop/stock_80_20_leaps/results/launchd_stdout.log</string>
+    <string>/Users/briansang/Desktop/stock_80_20_leaps/final_leaps/results/launchd_stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/briansang/Desktop/stock_80_20_leaps/results/launchd_stderr.log</string>
+    <string>/Users/briansang/Desktop/stock_80_20_leaps/final_leaps/results/launchd_stderr.log</string>
 
     <!-- Ensure PATH is set so Python finds shared libs -->
     <key>EnvironmentVariables</key>

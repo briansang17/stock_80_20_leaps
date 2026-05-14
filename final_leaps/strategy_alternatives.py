@@ -42,7 +42,7 @@ from strategy_backtest import (
     PROFILES, add_features, signals_in_window, bs_call, load_data,
     RISK_FREE_RATE, LEAPS_YEARS,
     EXIT_DD_50DMA, EXIT_VIX_HIGH, EXIT_VIX_SLOPE, EXIT_NEAR_EXP,
-    COMMISSION_PER_CONTRACT,
+    COMMISSION_PER_CONTRACT, DEFAULT_DATA_PATH,
 )
 from strategy_fresh_capital import TAX_SHORT, TAX_LONG, FreshLot
 
@@ -375,7 +375,7 @@ def print_row(name, m):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--per-lot", type=float, default=PER_LOT_DEFAULT)
-    parser.add_argument("--data", default="data_cache/term_structure.csv")
+    parser.add_argument("--data", default=str(DEFAULT_DATA_PATH))
     parser.add_argument("--out", default="results")
     args = parser.parse_args()
 

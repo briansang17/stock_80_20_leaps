@@ -20,12 +20,16 @@ __pycache__/
 # Local state (signal scripts use these to avoid duplicate emails)
 .last_notified.json
 .last_notified_top10.json
+**/.last_notified_top10.json
+**/.strategy_debounce.json
 
 # Local logs (GitHub Actions uploads its own log artifact)
-results/launchd_stdout.log
-results/launchd_stderr.log
+**/results/launchd_stdout.log
+**/results/launchd_stderr.log
 
-# Large local artifacts
+# Large local artifacts (root + final_leaps)
 results/*.png
 results/*.csv
+final_leaps/results/*.csv
 data_cache/*.csv
+final_leaps/data_cache/*.csv

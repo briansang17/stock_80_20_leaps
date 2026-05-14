@@ -55,7 +55,7 @@ jobs:
         if: steps.timecheck.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r final_leaps/requirements.txt
 
       - name: Run BUY signal scanner (top-10 entry rules)
         if: steps.timecheck.outputs.run == 'true'
@@ -70,7 +70,8 @@ jobs:
           if [ "${{ github.event.inputs.force }}" = "true" ]; then
             ARGS="--force"
           fi
-          python daily_signal_top10.py $ARGS
+          # Default --scan 1260 (5y history) is built into daily_signal_top10.py
+          python final_leaps/daily_signal_top10.py $ARGS
 
       - name: Run SELL signal scanner (top-10 exit rules)
         if: steps.timecheck.outputs.run == 'true'
@@ -92,6 +93,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: daily-signal-log
-          path: results/daily_top10_log.csv
+          path: final_leaps/results/daily_top10_log.csv
           retention-days: 90
           if-no-files-found: ignore

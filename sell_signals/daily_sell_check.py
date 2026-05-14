@@ -24,6 +24,8 @@ import pandas as pd
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Core BUY-side helpers (notify, strategy_*) now live in `final_leaps/`.
+sys.path.insert(0, str(PROJECT_ROOT / "final_leaps"))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 try:

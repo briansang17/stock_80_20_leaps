@@ -27,16 +27,16 @@ from daily_signal_top10 import (
 def simulate(window, sigs, debounce_days: int, hc_threshold: int):
     """Replays daily scan over window. Returns one row per email-day."""
     emails = []                                            # (date, fires, fresh, hc)
-    last_fire = {key: None for key, _, _, _ in STRATEGIES}
+    last_fire = {s.key: None for s in STRATEGIES}
 
     for date, row in window.iterrows():
         sigs_row = sigs.loc[date] if date in sigs.index else pd.Series({"score": 0})
         fired_today = []
-        for key, _, _, _ in STRATEGIES:
+        for s in STRATEGIES:
             try:
-                f, _ = explain_rule(key, row, sigs_row)
+                f, _ = explain_rule(s.key, row, sigs_row)
                 if f:
-                    fired_today.append(key)
+                    fired_today.append(s.key)
             except (KeyError, TypeError):
                 pass
 

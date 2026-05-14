@@ -43,11 +43,11 @@ def main():
     for date, row in window.iterrows():
         sigs_row = sigs.loc[date] if date in sigs.index else pd.Series({"score": 0})
         fired = []
-        for key, rule, _, _ in STRATEGIES:
+        for s in STRATEGIES:
             try:
-                f, _ = explain_rule(key, row, sigs_row)
+                f, _ = explain_rule(s.key, row, sigs_row)
                 if f:
-                    fired.append(key)
+                    fired.append(s.key)
             except (KeyError, TypeError):
                 pass
 
@@ -124,9 +124,9 @@ def main():
     print(f"\n  ── HOW OFTEN EACH STRATEGY FIRED ──")
     print(f"     {'Strategy':<17}  {'Days fired':>10}  {'% of trading days':>17}")
     print("     " + "─" * 55)
-    for s, _, _, _ in STRATEGIES:
-        c = per_strategy.get(s, 0)
-        print(f"     {s:<17}  {c:>10}  {c/n_trading_days*100:>15.0f}%")
+    for s in STRATEGIES:
+        c = per_strategy.get(s.key, 0)
+        print(f"     {s.key:<17}  {c:>10}  {c/n_trading_days*100:>15.0f}%")
 
     # ── Show the actual emails ──────────────────────────────────────────────
     print(f"\n  ── EVERY EMAIL YOU WOULD HAVE RECEIVED ──")

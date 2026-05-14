@@ -27,7 +27,7 @@ from strategy_backtest import (
     PROFILES, add_features, signals_in_window, bs_call, load_data,
     RISK_FREE_RATE, LEAPS_YEARS,
     EXIT_DD_50DMA, EXIT_VIX_HIGH, EXIT_VIX_SLOPE, EXIT_NEAR_EXP,
-    COMMISSION_PER_CONTRACT,
+    COMMISSION_PER_CONTRACT, DEFAULT_DATA_PATH,
 )
 
 DEFAULT_PER_LOT = 10_000          # $ per entry (fresh cash)
@@ -259,7 +259,7 @@ def main():
     parser.add_argument("--debounce", type=int, default=DEFAULT_DEBOUNCE)
     parser.add_argument("--start", default=None)
     parser.add_argument("--end", default=None)
-    parser.add_argument("--data", default="data_cache/term_structure.csv")
+    parser.add_argument("--data", default=str(DEFAULT_DATA_PATH))
     parser.add_argument("--out", default="results")
     args = parser.parse_args()
 

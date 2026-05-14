@@ -18,11 +18,16 @@ Usage:
 
 from __future__ import annotations
 import argparse, math, os, sys
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
 from dataclasses import dataclass
 from typing import Callable
+
+# Default data cache lives next to this file so the script works from
+# any CWD (e.g. `python final_leaps/daily_signal_top10.py` from repo root).
+DEFAULT_DATA_PATH = Path(__file__).resolve().parent / "data_cache" / "term_structure.csv"
 
 # ─── PROFILE CONFIGURATION ───────────────────────────────────────────────────
 PROFILES = {
@@ -65,7 +70,9 @@ EXIT_NEAR_EXP   = 4 / 12    # exit when option has < 4 months left
 COMMISSION_PER_CONTRACT = 0.65    # typical broker fee ($0.65/contract each side)
 
 # ─── DATA + FEATURES ─────────────────────────────────────────────────────────
-def load_data(path: str = "data_cache/term_structure.csv") -> pd.DataFrame:
+def load_data(path: str | Path = DEFAULT_DATA_PATH) -> pd.DataFrame:
+    """Load cached SPY+VIX term-structure CSV.  Defaults to a path
+    next to this file so it works regardless of CWD."""
     df = pd.read_csv(path, parse_dates=["Date"], index_col="Date")
     df = df.dropna(subset=["SPY", "VIX"])
     return df
@@ -272,7 +279,7 @@ def summarize(eq: pd.DataFrame, trades_df: pd.DataFrame, profile_name: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=list(PROFILES.keys()), default="BALANCED")
-    parser.add_argument("--data", default="data_cache/term_structure.csv")
+    parser.add_argument("--data", default=str(DEFAULT_DATA_PATH))
     parser.add_argument("--fractional", action="store_true",
                         help="Allow fractional contracts (unrealistic but matches old tests)")
     parser.add_argument("--out", default="results", help="Output directory")
