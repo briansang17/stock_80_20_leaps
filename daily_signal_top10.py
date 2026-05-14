@@ -361,10 +361,21 @@ def format_text_report(r: dict) -> str:
     out.append(f"  SPY LEAPS — TOP 10 STRATEGY SCANNER  •  {r['date']}  •  Mode: {r['mode']}")
     out.append("═" * 72)
     out.append("")
-    out.append("  Market state:")
-    out.append(f"    SPY ${r['spy']:.2f}    VIX {r['vix']:.2f}    RSI {r['rsi14']:.1f}")
-    out.append(f"    50DMA ${r['sma50']:.2f}    200DMA ${r['sma200']:.2f}    DD {r['drawdown']:+.1f}%")
-    out.append(f"    BB-width %ile {r['bb_width_pct']:.0f}%   MACD {r['macd']:+.2f}")
+    out.append("  Market state (today's metrics vs the thresholds we care about):")
+    out.append("")
+    out.append(f"  {'Metric':<18}  {'Value':>10}  {'Threshold(s)':<32}")
+    out.append("  " + "─" * 68)
+    spy_v = r["spy"];      sma50 = r["sma50"];   sma200 = r["sma200"]
+    vix_v = r["vix"];      rsi   = r["rsi14"];   macd_v = r["macd"]
+    bb    = r["bb_width_pct"]; dd  = r["drawdown"]
+    out.append(f"  {'SPY price':<18}  ${spy_v:>9.2f}  vs 50DMA ${sma50:.0f} / 200DMA ${sma200:.0f}")
+    out.append(f"  {'SPY vs 50DMA':<18}  {(spy_v/sma50-1)*100:>+9.1f}%  >0% = bullish trend intact")
+    out.append(f"  {'SPY vs 200DMA':<18}  {(spy_v/sma200-1)*100:>+9.1f}%  >0% = long-term uptrend OK")
+    out.append(f"  {'SPY drawdown':<18}  {dd:>+9.1f}%  >-10% = healthy / <-15% = oversold zone")
+    out.append(f"  {'VIX':<18}  {vix_v:>10.2f}  <16 cheap • <20 calm • >25 fear • >30 spike")
+    out.append(f"  {'RSI(14)':<18}  {rsi:>10.1f}  <35 oversold • 40-65 sweet spot • >70 overbought")
+    out.append(f"  {'MACD':<18}  {macd_v:>+10.2f}  >0 = momentum positive")
+    out.append(f"  {'BB-width %ile':<18}  {bb:>9.0f}%  <20% = squeeze (low vol, breakout pending)")
     out.append("")
 
     if r["mode"] == "DEBOUNCED":
@@ -421,10 +432,16 @@ def format_text_report(r: dict) -> str:
 
     not_fired = [f for f in r["fires"] if not f["fired"]]
     if not_fired:
-        out.append("  ── Not firing today ──")
+        out.append("  ── Not firing today (full condition breakdown) ──")
+        out.append("")
         for f in not_fired:
             failed = [c for c in f["conds"] if c.startswith("❌")]
-            out.append(f"  🔴 {f['key']:<18} — {len(failed)} of {len(f['conds'])} conditions miss")
+            out.append(f"  🔴 {f['key']:<18} ({f['freq']:.1f}/yr) — "
+                       f"{len(failed)} of {len(f['conds'])} conditions failed")
+            out.append(f"     {f['layman']}")
+            for c in f["conds"]:
+                out.append(f"       {c}")
+            out.append("")
 
     out.append("")
     out.append("═" * 72)
