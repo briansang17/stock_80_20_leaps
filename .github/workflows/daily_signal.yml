@@ -2,10 +2,13 @@ name: Daily LEAPS Signal Check
 
 on:
   schedule:
-    # Mon-Fri at 21:30 UTC = 4:30pm ET (DST) / 5:30pm ET (standard)
-    # Always runs after US market close (4pm ET) so all data is available.
-    - cron: '30 21 * * 1-5'
-  workflow_dispatch:   # allow manual trigger from GitHub UI
+    # Fire on BOTH 21:00 and 22:00 UTC Mon-Fri.  A guard step below
+    # only actually runs the scanner when the wall clock in New York
+    # is 5pm (17:00 ET).  This makes the email arrive at 5pm ET
+    # year-round (auto-handles EDT vs EST).
+    - cron: '0 21 * * 1-5'   # 5pm EDT  (mid-Mar -> early Nov)
+    - cron: '0 22 * * 1-5'   # 5pm EST  (early Nov -> mid-Mar)
+  workflow_dispatch:         # allow manual trigger from GitHub UI
     inputs:
       force:
         description: 'Force email even when no signals fire'
@@ -18,21 +21,44 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Skip if not 5pm in New York
+        id: timecheck
+        run: |
+          # Manual workflow_dispatch always runs; scheduled runs only at 5pm ET.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Manual trigger — running."
+          else
+            HOUR_ET=$(TZ=America/New_York date +%H)
+            echo "Current hour in New York: $HOUR_ET"
+            if [ "$HOUR_ET" = "17" ]; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              echo "✅ It is 5pm ET — running scanner."
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "⏭  Not 5pm ET — skipping (other cron will fire instead)."
+            fi
+          fi
+
       - name: Checkout repository
+        if: steps.timecheck.outputs.run == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
+        if: steps.timecheck.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
+        if: steps.timecheck.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run top-10 signal scanner
+        if: steps.timecheck.outputs.run == 'true'
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
@@ -47,7 +73,7 @@ jobs:
           python daily_signal_top10.py $ARGS
 
       - name: Upload log artifact (signal history)
-        if: always()
+        if: steps.timecheck.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: daily-signal-log
