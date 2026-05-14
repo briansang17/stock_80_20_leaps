@@ -23,10 +23,15 @@ Example
     python final_leaps/plot_high_conviction_returns.py
     python final_leaps/plot_high_conviction_returns.py --years 5
     python final_leaps/plot_high_conviction_returns.py --per-lot 10000
+
+    # NEW — print a side-by-side 1y / 2y / 5y / 10y comparison
+    # (runs simulation once on the longest window, then slices it).
+    python final_leaps/plot_high_conviction_returns.py --compare
 """
 
 from __future__ import annotations
 import argparse
+from itertools import combinations
 from pathlib import Path
 
 import pandas as pd
@@ -62,12 +67,63 @@ CONFIG = {
 
 # ─── HC DAY DETECTION ────────────────────────────────────────────────────────
 
+def scan_all_fires(feats: pd.DataFrame, sigs: pd.DataFrame,
+                   start: pd.Timestamp, end: pd.Timestamp) -> list[dict]:
+    """One pass over [start, end] recording the FULL fired-strategy set per day.
+
+    Cheaper than calling find_hc_days repeatedly with different gates — the
+    sweeper filters this list in pure Python instead of re-scanning."""
+    window = feats.loc[start:end]
+    rows = []
+    for date, row in tqdm(window.iterrows(), total=len(window),
+                          desc="  Scanning all fires", ncols=80):
+        sigs_row = sigs.loc[date] if date in sigs.index else pd.Series({"score": 0})
+        fired = []
+        for s in STRATEGIES:
+            try:
+                if explain_rule(s.key, row, sigs_row)[0]:
+                    fired.append(s.key)
+            except (KeyError, TypeError):
+                pass
+        rows.append({"date": date, "fired": fired, "n": len(fired)})
+    return rows
+
+
+def apply_gate(all_days: list[dict], threshold: int,
+               require_any: list[str] | None = None,
+               require_all: list[str] | None = None) -> list[dict]:
+    """Filter a `scan_all_fires` list by HC threshold + anchor gates.
+
+    require_any:  at least ONE of these must be in the firing set
+    require_all:  ALL of these must be in the firing set
+    """
+    any_set = set(require_any or [])
+    all_set = set(require_all or [])
+    out = []
+    for d in all_days:
+        if d["n"] < threshold:
+            continue
+        fset = set(d["fired"])
+        if any_set and not (any_set & fset):
+            continue
+        if all_set and not all_set.issubset(fset):
+            continue
+        out.append(d)
+    return out
+
+
 def find_hc_days(feats: pd.DataFrame, sigs: pd.DataFrame,
-                 start: pd.Timestamp, end: pd.Timestamp) -> list[dict]:
+                 start: pd.Timestamp, end: pd.Timestamp,
+                 require_any: list[str] | None = None) -> list[dict]:
     """Scan [start, end] day-by-day, return every day where ≥`hc_threshold`
-    of the 10 strategies fired."""
+    of the 10 strategies fired.
+
+    If `require_any` is non-empty, also require that at least ONE strategy
+    from that set is among the day's firing strategies (e.g. only count an
+    HC day if it includes A_CHEAP_IV or C_BREAKOUT)."""
     window = feats.loc[start:end]
     hc = []
+    required = set(require_any or [])
     for date, row in tqdm(window.iterrows(), total=len(window),
                           desc="  Finding HC days", ncols=80):
         sigs_row = sigs.loc[date] if date in sigs.index else pd.Series({"score": 0})
@@ -79,6 +135,8 @@ def find_hc_days(feats: pd.DataFrame, sigs: pd.DataFrame,
             except (KeyError, TypeError):
                 pass
         if len(fired) >= CONFIG["hc_threshold"]:
+            if required and not (required & set(fired)):
+                continue   # HC by count, but missing the required-any anchor
             hc.append({"date": date, "fired": fired, "n": len(fired)})
     return hc
 
@@ -222,6 +280,228 @@ def print_summary(trades: pd.DataFrame, years: float):
     print("═" * 78)
 
 
+# ─── MULTI-WINDOW COMPARISON ─────────────────────────────────────────────────
+
+def _window_stats(trades: pd.DataFrame, years: float, end: pd.Timestamp) -> dict:
+    """Compute headline stats for trades entered in the last `years` years."""
+    start = end - pd.Timedelta(days=int(365 * years))
+    sub = trades[trades["entry_date"] >= start].copy()
+    n = len(sub)
+    if n == 0:
+        return {"years": years, "n": 0}
+    wins   = (sub["pct"] > 0).sum()
+    losses = n - wins
+    cost   = sub["cost"].sum()
+    val    = sub["exit_value"].sum()
+    net    = val - cost
+    avg_days = sub["held_days"].mean()
+    avg_pct  = sub["pct"].mean()
+    ann_per_trade = (((1 + avg_pct) ** (365 / avg_days) - 1) * 100
+                     if avg_days > 0 and avg_pct > -1 else float("nan"))
+    return {
+        "years": years, "n": n, "wins": wins, "losses": losses,
+        "win_rate": wins / n * 100,
+        "avg_pct": avg_pct * 100,
+        "median_pct": sub["pct"].median() * 100,
+        "best_pct": sub["pct"].max() * 100,
+        "worst_pct": sub["pct"].min() * 100,
+        "avg_days": avg_days,
+        "cost": cost, "val": val, "net": net,
+        "roi": net / cost * 100 if cost else float("nan"),
+        "ann_per_trade": ann_per_trade,
+        "still_open": int((sub["exit_reason"] == "still open").sum()),
+    }
+
+
+def print_multi_window(trades: pd.DataFrame, end: pd.Timestamp,
+                       windows: list[float] = (1, 2, 5, 10),
+                       require_any: list[str] | None = None):
+    """Side-by-side comparison of HC LEAPS performance over multiple windows."""
+    rows = [_window_stats(trades, y, end) for y in windows]
+    gate = (f"  •  must include one of {{{','.join(require_any)}}}"
+            if require_any else "")
+    print("\n" + "═" * 78)
+    print("  HIGH-CONVICTION LEAPS — multi-window comparison")
+    print(f"  As of {end.date()}  •  per-lot ${CONFIG['per_lot']:,}  "
+          f"•  OTM {CONFIG['otm_pct']*100:.0f}%  •  ≥{CONFIG['hc_threshold']}/10 strategies"
+          f"{gate}")
+    print("═" * 78)
+    hdr = f"  {'Window':<10}{'Trades':>8}{'Win rate':>12}{'Avg/trd':>10}" \
+          f"{'Best':>10}{'Worst':>10}{'Held':>8}{'Invested':>12}" \
+          f"{'Net P&L':>12}{'ROI':>9}{'Ann/trd':>10}"
+    print(hdr)
+    print("  " + "─" * (len(hdr) - 2))
+    for r in rows:
+        if r["n"] == 0:
+            print(f"  {r['years']:>3.0f}-yr     "
+                  f"{'(no HC days in window)':>76}")
+            continue
+        open_tag = f" ({r['still_open']} open)" if r["still_open"] else ""
+        print(
+            f"  {r['years']:>3.0f}-yr    "
+            f"{r['n']:>5}{open_tag:<3}"
+            f"{r['wins']:>4}/{r['n']:<3} "
+            f"{r['win_rate']:>4.0f}% "
+            f"{r['avg_pct']:>+8.1f}%"
+            f"{r['best_pct']:>+8.0f}%"
+            f"{r['worst_pct']:>+8.0f}%"
+            f"{r['avg_days']:>6.0f}d"
+            f"  ${r['cost']:>9,.0f}"
+            f"  ${r['net']:>+10,.0f}"
+            f"{r['roi']:>+7.0f}%"
+            f"{r['ann_per_trade']:>+8.1f}%"
+        )
+    print("═" * 78)
+    print("  Notes:")
+    print("    • 'Trades' counts HC entries after the 14-day debounce.")
+    print("    • Open trades (held < 500 d) are marked-to-market at the last close.")
+    print("    • 'Ann/trd' = annualized return per held dollar, "
+          "= (1+avg_pct)^(365/avg_days) - 1.")
+    print("    • Longer windows include older trades that are already closed; "
+          "shorter windows can include open positions.")
+    print("═" * 78 + "\n")
+
+
+# ─── GATE SWEEP ──────────────────────────────────────────────────────────────
+
+def _gate_label(threshold: int, ra: list[str] | None, rl: list[str] | None) -> str:
+    """Short readable label for a gate spec (used in leaderboard rows)."""
+    short = lambda k: k.split("_")[0]   # "A_CHEAP_IV" -> "A"
+    if rl:
+        return f"≥{threshold}  &  ALL of {{{'+'.join(short(k) for k in rl)}}}"
+    if ra:
+        if len(ra) == 1:
+            return f"≥{threshold}  &  includes {short(ra[0])}"
+        return f"≥{threshold}  &  one of {{{','.join(short(k) for k in ra)}}}"
+    return f"≥{threshold}  (no anchor gate)"
+
+
+def sweep_combinations(all_days: list[dict], feats: pd.DataFrame,
+                       end_date: pd.Timestamp,
+                       windows: list[float] = (1, 2, 5, 10)) -> pd.DataFrame:
+    """Try a battery of (threshold, anchor-gate) combinations.
+
+    Combos tested:
+      • threshold ∈ {2, 3}, no anchor gate
+      • threshold ∈ {2, 3}, "must include X" for each top-5 strategy
+      • threshold = 3, "must include one of {X, Y}" for every top-5 pair
+      • threshold = 3, "must include BOTH X and Y" for every top-3 pair
+
+    Returns a DataFrame sorted by 10-yr net P&L (descending)."""
+    keys  = [s.key for s in STRATEGIES]
+    top5  = keys[:5]
+    top3  = keys[:3]
+    combos: list[tuple[int, list[str] | None, list[str] | None]] = []
+    for thr in (2, 3):
+        combos.append((thr, None, None))
+        for k in top5:
+            combos.append((thr, [k], None))
+    for k1, k2 in combinations(top5, 2):
+        combos.append((3, [k1, k2], None))
+    for k1, k2 in combinations(top3, 2):
+        combos.append((3, None, [k1, k2]))
+
+    rows = []
+    for thr, ra, rl in tqdm(combos, desc="  Sweeping gates", ncols=80):
+        gated = apply_gate(all_days, thr, ra, rl)
+        label = _gate_label(thr, ra, rl)
+        if not gated:
+            rows.append({"gate": label, "n_hc_days": 0, "n_trades": 0})
+            continue
+        trades = simulate_trades(feats, gated)
+        if trades.empty:
+            rows.append({"gate": label, "n_hc_days": len(gated), "n_trades": 0})
+            continue
+        row = {"gate": label, "n_hc_days": len(gated), "n_trades": len(trades)}
+        for y in windows:
+            s = _window_stats(trades, y, end_date)
+            row[f"{y:.0f}y_trades"] = s.get("n", 0)
+            row[f"{y:.0f}y_win"]    = s.get("win_rate", float("nan"))
+            row[f"{y:.0f}y_avg"]    = s.get("avg_pct", float("nan"))
+            row[f"{y:.0f}y_net"]    = s.get("net", 0.0)
+            row[f"{y:.0f}y_roi"]    = s.get("roi", float("nan"))
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    if "10y_net" in df.columns:
+        df = df.sort_values("10y_net", ascending=False).reset_index(drop=True)
+    return df
+
+
+def print_sweep_per_window(df: pd.DataFrame, top_n: int = 12,
+                           windows: tuple[float, ...] = (1, 2, 5, 10)):
+    """For the top-N gates (already sorted by 10y net P&L), print a compact
+    per-window breakdown (rows = windows, cols = trades/win/avg/net/ROI)."""
+    rows = df.head(top_n)
+    print("\n" + "═" * 95)
+    print(f"  PER-WINDOW BREAKDOWN — top {len(rows)} gates  •  1y / 2y / 5y / 10y")
+    print("═" * 95)
+    for idx, r in enumerate(rows.itertuples(), 1):
+        print(f"  [{idx:>2}] {r.gate:<42}  ({int(r.n_trades)} trades, "
+              f"{int(r.n_hc_days)} HC days raw)")
+        print(f"       {'Window':<8}{'Trades':>9}{'Win rate':>11}"
+              f"{'Avg/trd':>11}{'Net $':>14}{'ROI':>9}")
+        print(f"       " + "─" * 65)
+        for y in windows:
+            n   = getattr(r, f"_{int(y)}y_trades", None) if False else None
+            yk  = f"{int(y)}y"
+            # Pull values by dict-like access so we don't depend on dataclass attrs
+            d   = df.loc[r.Index].to_dict()
+            n   = int(d.get(f"{yk}_trades", 0) or 0)
+            wn  = d.get(f"{yk}_win", float("nan"))
+            av  = d.get(f"{yk}_avg", float("nan"))
+            nt  = d.get(f"{yk}_net", float("nan"))
+            ro  = d.get(f"{yk}_roi", float("nan"))
+            if n == 0:
+                print(f"       {yk:<8}{'-':>9}{'-':>11}{'-':>11}{'-':>14}{'-':>9}")
+                continue
+            print(f"       {yk:<8}{n:>9}"
+                  f"{wn:>9.0f}% "
+                  f"{av:>+9.1f}% "
+                  f"${nt:>+11,.0f}"
+                  f"{ro:>+8.0f}%")
+        print()
+    print("═" * 95 + "\n")
+
+
+def print_sweep_leaderboard(df: pd.DataFrame, top_n: int = 20):
+    """Print the gate-sweep leaderboard, top + bottom rows for context."""
+    print("\n" + "═" * 113)
+    print("  HIGH-CONVICTION GATE SWEEP — leaderboard (sorted by 10-yr net P&L on $7,500/lot)")
+    print("═" * 113)
+    hdr = (f"  {'#':>3}  {'Gate':<40}"
+           f"{'HC days':>9}{'Trades':>8}"
+           f"{'Win10y':>9}{'Avg10y':>9}{'Net10y':>13}{'ROI10y':>9}"
+           f"{'Win2y':>9}{'Win1y':>9}")
+    print(hdr)
+    print("  " + "─" * (len(hdr) - 2))
+    nrows = len(df)
+    take_top    = min(top_n, nrows)
+    show_bottom = max(0, min(3, nrows - take_top))
+    def _fmt(r, rank):
+        win10 = (f"{r['10y_win']:>5.0f}%" if pd.notna(r.get('10y_win')) else "   - ")
+        avg10 = (f"{r['10y_avg']:>+6.1f}%" if pd.notna(r.get('10y_avg')) else "   -  ")
+        net10 = (f"${r['10y_net']:>+10,.0f}" if pd.notna(r.get('10y_net')) else "     -    ")
+        roi10 = (f"{r['10y_roi']:>+6.0f}%" if pd.notna(r.get('10y_roi')) else "   -  ")
+        win2  = (f"{r['2y_win']:>5.0f}%"  if pd.notna(r.get('2y_win'))  else "   - ")
+        win1  = (f"{r['1y_win']:>5.0f}%"  if pd.notna(r.get('1y_win'))  else "   - ")
+        print(f"  {rank:>3}  {r['gate']:<40}"
+              f"{int(r['n_hc_days']):>9}{int(r['n_trades']):>8}"
+              f"   {win10}  {avg10}  {net10}    {roi10}"
+              f"   {win2}   {win1}")
+    for i in range(take_top):
+        _fmt(df.iloc[i], i + 1)
+    if show_bottom:
+        print("  " + "·" * (len(hdr) - 2))
+        for i in range(nrows - show_bottom, nrows):
+            _fmt(df.iloc[i], i + 1)
+    print("═" * 113)
+    print("  • 'HC days' = raw matching days before debounce.  'Trades' = after 14-day debounce.")
+    print("  • Win10y = 10-yr win rate.  Win2y / Win1y = recent-window win rates.")
+    print("  • Sorted by absolute 10-yr net P&L on $7,500 deployed per entry — "
+          "the gate that compounds the most capital wins.")
+    print("═" * 113 + "\n")
+
+
 # ─── CHART ───────────────────────────────────────────────────────────────────
 
 def plot_results(feats: pd.DataFrame, trades: pd.DataFrame, out_path: Path):
@@ -322,7 +602,29 @@ def main():
                    help=f"$ deployed per entry (default {CONFIG['per_lot']})")
     p.add_argument("--otm",     type=float, default=CONFIG["otm_pct"],
                    help=f"OTM percentage (default {CONFIG['otm_pct']})")
+    p.add_argument("--compare", action="store_true",
+                   help="Print 1y / 2y / 5y / 10y side-by-side comparison "
+                        "(runs simulation once on 10y window, no chart).")
+    p.add_argument("--windows", type=str, default="1,2,5,10",
+                   help="Comma-separated list of look-back years for --compare "
+                        "(default 1,2,5,10).")
+    p.add_argument("--require", type=str, default="",
+                   help="Comma-separated list of strategy keys; only count an HC "
+                        "day if AT LEAST ONE of these is among the firing set. "
+                        "Example: --require A_CHEAST_IV,C_BREAKOUT")
+    p.add_argument("--sweep", action="store_true",
+                   help="Run every sensible gate combo (single anchors, pairs, "
+                        "thresholds 2 and 3, AND/OR gates) and print a "
+                        "leaderboard sorted by 10-yr net P&L.  No chart.")
+    p.add_argument("--top", type=int, default=20,
+                   help="How many leaderboard rows to show in --sweep mode "
+                        "(default 20).")
+    p.add_argument("--per-window", type=int, default=0,
+                   help="In --sweep mode, also print a per-window (1y/2y/5y/10y) "
+                        "breakdown for the top N gates (default 0 = skip).")
     args = p.parse_args()
+
+    require_any = [s.strip() for s in args.require.split(",") if s.strip()]
 
     CONFIG["per_lot"] = args.per_lot
     CONFIG["otm_pct"] = args.otm
@@ -338,14 +640,38 @@ def main():
     feats = extend_features(df)
     sigs  = signals_in_window(feats, 1)
 
-    end_date   = feats.index[-1]
-    start_date = end_date - pd.Timedelta(days=int(365 * args.years))
-    print(f"\n  Period: {start_date.date()} → {end_date.date()}  "
-          f"({args.years:.1f} years)")
+    windows = [float(w) for w in args.windows.split(",") if w.strip()]
+    # In --compare and --sweep we always look back over the longest window
+    # so smaller windows can be sliced from the same data set.
+    look_years = max(windows) if (args.compare or args.sweep) else args.years
 
-    hc_days = find_hc_days(feats, sigs, start_date, end_date)
+    end_date   = feats.index[-1]
+    start_date = end_date - pd.Timedelta(days=int(365 * look_years))
+    print(f"\n  Period: {start_date.date()} → {end_date.date()}  "
+          f"({look_years:.1f} years)")
+
+    # ── SWEEP: one scan of all daily fires, then iterate gate combos ────────
+    if args.sweep:
+        all_days = scan_all_fires(feats, sigs, start_date, end_date)
+        sweep_df = sweep_combinations(all_days, feats, end_date,
+                                      windows=windows)
+        out_dir = Path(__file__).resolve().parent
+        csv_path = out_dir / "graphs" / "hc_gate_sweep.csv"
+        csv_path.parent.mkdir(exist_ok=True)
+        sweep_df.to_csv(csv_path, index=False)
+        print(f"\n  💾 Saved sweep results: {csv_path}")
+        print_sweep_leaderboard(sweep_df, top_n=args.top)
+        if args.per_window > 0:
+            print_sweep_per_window(sweep_df, top_n=args.per_window,
+                                   windows=tuple(windows))
+        return
+
+    hc_days = find_hc_days(feats, sigs, start_date, end_date,
+                           require_any=require_any)
+    extra = (f"  +  required one of: {', '.join(require_any)}"
+             if require_any else "")
     print(f"  Found {len(hc_days)} HC days "
-          f"(≥{CONFIG['hc_threshold']} strategies firing same day)")
+          f"(≥{CONFIG['hc_threshold']} strategies firing same day{extra})")
 
     if not hc_days:
         print("  ⚠️  No HC days in window — exiting.")
@@ -355,14 +681,19 @@ def main():
     print(f"  After {CONFIG['debounce_days']}-day debounce: "
           f"{len(trades)} unique LEAPS trades.")
 
-    print_summary(trades, args.years)
-
     out_dir = Path(__file__).resolve().parent
     csv_path = out_dir / CONFIG["output_csv"]
     csv_path.parent.mkdir(exist_ok=True)
     trades.to_csv(csv_path, index=False)
     print(f"\n  💾 Saved trades CSV: {csv_path}")
 
+    if args.compare:
+        # Skip the chart — print the comparison table and exit.
+        print_multi_window(trades, end_date, windows=windows,
+                           require_any=require_any)
+        return
+
+    print_summary(trades, args.years)
     plot_results(feats.loc[start_date:end_date], trades,
                  out_dir / CONFIG["output_chart"])
     print()
