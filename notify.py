@@ -43,9 +43,21 @@ def notify_email(subject: str, body: str) -> bool:
     smtp_pass = os.environ.get("SMTP_PASS") or cfg.get("smtp_pass")
     smtp_to   = os.environ.get("SMTP_TO")   or cfg.get("smtp_to") or smtp_user
     smtp_host = os.environ.get("SMTP_HOST") or cfg.get("smtp_host", "smtp.gmail.com")
-    smtp_port = int(os.environ.get("SMTP_PORT") or cfg.get("smtp_port", 465))
+    raw_port  = os.environ.get("SMTP_PORT") or cfg.get("smtp_port", 465)
+    try:
+        smtp_port = int(str(raw_port).strip().strip('"').strip("'"))
+    except (TypeError, ValueError):
+        print(f"  ⚠️  SMTP_PORT is not a valid integer (got '{raw_port}'); falling back to 465")
+        smtp_port = 465
+
+    # Trim accidental whitespace / quotes from secret values
+    if smtp_user: smtp_user = smtp_user.strip().strip('"').strip("'")
+    if smtp_pass: smtp_pass = smtp_pass.strip().strip('"').strip("'")
+    if smtp_to:   smtp_to   = smtp_to.strip().strip('"').strip("'")
+    if smtp_host: smtp_host = smtp_host.strip().strip('"').strip("'")
 
     if not smtp_user or not smtp_pass:
+        print("  ⚠️  SMTP_USER or SMTP_PASS not set — cannot send email")
         return False
 
     try:
