@@ -504,10 +504,26 @@ def print_sweep_leaderboard(df: pd.DataFrame, top_n: int = 20):
 
 # ─── CHART ───────────────────────────────────────────────────────────────────
 
-def plot_results(feats: pd.DataFrame, trades: pd.DataFrame, out_path: Path):
-    """Build the three-panel summary chart."""
-    fig = plt.figure(figsize=(15, 11))
-    gs  = fig.add_gridspec(3, 1, height_ratios=[2.0, 1.0, 1.4], hspace=0.42)
+def plot_results(feats: pd.DataFrame, trades: pd.DataFrame, out_path: Path,
+                 gate_label: str = "",
+                 all_days: list[dict] | None = None):
+    """Build the four-panel summary chart.
+
+    `gate_label`: optional human-readable string of the anchor gate, shown
+    in the title.  Empty string = no gate.
+    `all_days`: list of {date, fired, n} from `scan_all_fires`.  If given,
+    a 4th panel is drawn showing # strategies firing per day (red=0,
+    orange=1-2, green=HC threshold reached) plus a yellow ★ on each
+    actual trade entry — mirrors the bottom panel of FINAL_strategy_A.png.
+    """
+    has_signals_panel = all_days is not None and len(all_days) > 0
+    if has_signals_panel:
+        fig = plt.figure(figsize=(15, 13))
+        gs  = fig.add_gridspec(4, 1, height_ratios=[2.0, 1.0, 1.4, 1.1],
+                               hspace=0.42)
+    else:
+        fig = plt.figure(figsize=(15, 11))
+        gs  = fig.add_gridspec(3, 1, height_ratios=[2.0, 1.0, 1.4], hspace=0.42)
 
     win_rate = (trades["pct"] > 0).mean() * 100
     avg_pct  = trades["pct"].mean() * 100
@@ -519,9 +535,11 @@ def plot_results(feats: pd.DataFrame, trades: pd.DataFrame, out_path: Path):
     plt.rcParams["text.usetex"]    = False
     plt.rcParams["mathtext.default"] = "regular"
     title_dollars = f"\\${net:+,.0f} on \\${total_invested:,.0f}"
+    gate_suffix = f"  •  {gate_label}" if gate_label else ""
+    n_anchor_plus = CONFIG["hc_threshold"] - 1
     fig.suptitle(
         f"SPY +15% OTM LEAPS bought on every HIGH-CONVICTION day  "
-        f"(≥{CONFIG['hc_threshold']} of 10 strategies agreeing)\n"
+        f"(anchor + {n_anchor_plus} more of any 10 strategies){gate_suffix}\n"
         f"{len(trades)} trades  •  win rate {win_rate:.0f}%  •  "
         f"avg trade {avg_pct:+.1f}%  •  net {title_dollars} deployed",
         fontsize=13, fontweight="bold", y=0.995,
@@ -588,6 +606,38 @@ def plot_results(feats: pd.DataFrame, trades: pd.DataFrame, out_path: Path):
     ax3.xaxis.set_major_locator(mdates.YearLocator())
     ax3.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 
+    # ── Panel 4: signal-count-per-day with HC threshold + entry stars ────────
+    if has_signals_panel:
+        ax4 = fig.add_subplot(gs[3])
+        thr = CONFIG["hc_threshold"]
+        dates  = [d["date"] for d in all_days]
+        counts = [d["n"]    for d in all_days]
+        # Colour: red=0, orange=1..(thr-1), green=>=thr (HC reached)
+        colors = ["#dc3545" if n == 0
+                  else ("#ffc107" if n < thr else "#28a745")
+                  for n in counts]
+        ax4.bar(dates, counts, color=colors, width=1.2, alpha=0.95)
+        ax4.axhline(thr, color="white", ls="--", lw=1.2, alpha=0.85,
+                    label=f"HC threshold = {thr}")
+        # Yellow stars on each ACTUAL entry day (after gate + debounce)
+        if not trades.empty:
+            star_y = max(counts) + 0.6
+            ax4.scatter(trades["entry_date"],
+                        [star_y] * len(trades),
+                        marker="*", s=130, c="#FFD700",
+                        edgecolor="black", linewidth=0.5, zorder=6,
+                        label=f"Trade entry ({len(trades)})")
+            ax4.set_ylim(0, star_y + 0.8)
+        ax4.set_ylabel("# strategies firing")
+        ax4.set_title(f"Signals fired per day  •  green = HC "
+                      f"(≥{thr} firing)  •  orange = 1..{thr-1}  "
+                      f"•  red = 0  •  ★ = trade entry",
+                      fontsize=11)
+        ax4.legend(loc="upper left", fontsize=9)
+        ax4.grid(alpha=0.3, axis="y")
+        ax4.xaxis.set_major_locator(mdates.YearLocator())
+        ax4.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
     print(f"\n  💾 Saved chart: {out_path}")
 
@@ -609,9 +659,15 @@ def main():
                    help="Comma-separated list of look-back years for --compare "
                         "(default 1,2,5,10).")
     p.add_argument("--require", type=str, default="",
-                   help="Comma-separated list of strategy keys; only count an HC "
-                        "day if AT LEAST ONE of these is among the firing set. "
-                        "Example: --require A_CHEAST_IV,C_BREAKOUT")
+                   help="OR-gate: only count an HC day if AT LEAST ONE of these "
+                        "strategy keys is in the firing set.  "
+                        "Example: --require A_CHEAP_IV,C_BREAKOUT  "
+                        "= (A fires OR C fires) AND ≥2 others fire.")
+    p.add_argument("--require-all", type=str, default="",
+                   help="AND-gate: only count an HC day if ALL of these strategy "
+                        "keys are in the firing set.  "
+                        "Example: --require-all A_CHEAP_IV,B_TREND_FOLLOW  "
+                        "= A AND B fire AND ≥1 other fires.  Stricter than --require.")
     p.add_argument("--sweep", action="store_true",
                    help="Run every sensible gate combo (single anchors, pairs, "
                         "thresholds 2 and 3, AND/OR gates) and print a "
@@ -625,6 +681,10 @@ def main():
     args = p.parse_args()
 
     require_any = [s.strip() for s in args.require.split(",") if s.strip()]
+    require_all = [s.strip() for s in args.require_all.split(",") if s.strip()]
+    if require_any and require_all:
+        sys.exit("❌ Pass either --require (OR-gate) OR --require-all (AND-gate), "
+                 "not both.")
 
     CONFIG["per_lot"] = args.per_lot
     CONFIG["otm_pct"] = args.otm
@@ -666,10 +726,18 @@ def main():
                                    windows=tuple(windows))
         return
 
-    hc_days = find_hc_days(feats, sigs, start_date, end_date,
-                           require_any=require_any)
-    extra = (f"  +  required one of: {', '.join(require_any)}"
-             if require_any else "")
+    # Scan ALL days once (cheap), then filter to HC days for trade sim.
+    # The full per-day fires list is what powers the bottom 'Signals fired' panel.
+    all_days = scan_all_fires(feats, sigs, start_date, end_date)
+    hc_days  = apply_gate(all_days, threshold=CONFIG["hc_threshold"],
+                          require_any=require_any or None,
+                          require_all=require_all or None)
+    if require_all:
+        extra = f"  +  ALL required: {', '.join(require_all)}"
+    elif require_any:
+        extra = f"  +  one of: {', '.join(require_any)}"
+    else:
+        extra = ""
     print(f"  Found {len(hc_days)} HC days "
           f"(≥{CONFIG['hc_threshold']} strategies firing same day{extra})")
 
@@ -694,8 +762,28 @@ def main():
         return
 
     print_summary(trades, args.years)
-    plot_results(feats.loc[start_date:end_date], trades,
-                 out_dir / CONFIG["output_chart"])
+
+    # Gate-aware filename so re-running with --require doesn't overwrite the
+    # baseline chart.  e.g. require=[A_CHEAP_IV, C_BREAKOUT] → "hc_A+C.png"
+    if require_all:
+        short = "&".join(k.split("_")[0] for k in require_all)
+        chart_path = out_dir / "graphs" / f"hc_AND_{short}.png"
+        gate_label = (f"AND-gate: ALL of {{{', '.join(require_all)}}} "
+                      f"must fire + ≥{CONFIG['hc_threshold'] - len(require_all)} more")
+    elif require_any:
+        short = "+".join(k.split("_")[0] for k in require_any)
+        chart_path = out_dir / "graphs" / f"hc_{short}.png"
+        anchor_str = " OR ".join(f"{k.split('_')[0]} + others"
+                                 for k in require_any)
+        gate_label = f"anchor ∈ {{{', '.join(require_any)}}}  ({anchor_str})"
+    else:
+        chart_path = out_dir / CONFIG["output_chart"]
+        gate_label = ""
+
+    # Filter all_days to the chart window so the bottom panel matches the x-axis
+    plot_window = [d for d in all_days if start_date <= d["date"] <= end_date]
+    plot_results(feats.loc[start_date:end_date], trades, chart_path,
+                 gate_label=gate_label, all_days=plot_window)
     print()
 
 
