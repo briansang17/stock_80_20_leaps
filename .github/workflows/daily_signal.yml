@@ -57,7 +57,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run top-10 signal scanner
+      - name: Run BUY signal scanner (top-10 entry rules)
         if: steps.timecheck.outputs.run == 'true'
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -71,6 +71,21 @@ jobs:
             ARGS="--force"
           fi
           python daily_signal_top10.py $ARGS
+
+      - name: Run SELL signal scanner (top-10 exit rules)
+        if: steps.timecheck.outputs.run == 'true'
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO:   ${{ secrets.SMTP_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            ARGS="--force"
+          fi
+          python sell_signals/daily_sell_check.py $ARGS
 
       - name: Upload log artifact (signal history)
         if: steps.timecheck.outputs.run == 'true'
