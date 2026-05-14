@@ -26,8 +26,13 @@ Win rate and edge figures come from `FINAL_STRATEGY.md` backtests
 
 Historical scan default: 1,260 trading days ≈ 5 years.
 
+This script also runs the SELL-side scanner from `sell_signals/` in the
+same process so BOTH BUY and SELL verdicts are combined into ONE email.
+Pass `--no-sell` to keep the email BUY-only.
+
 Usage:
-  python daily_signal_top10.py                # check, email if fires, 5y scan
+  python daily_signal_top10.py                # BUY + SELL combined email
+  python daily_signal_top10.py --no-sell      # BUY only (legacy behaviour)
   python daily_signal_top10.py --force        # email even with no fires
   python daily_signal_top10.py --quiet        # just print, no email
   python daily_signal_top10.py --otm 0.15     # change OTM target (default 15%)
@@ -63,6 +68,10 @@ from strategy_alternatives import (
 )
 
 PROJECT_DIR = Path(__file__).resolve().parent
+# Repo root needs to be on sys.path so we can import the sell-side scanner
+# (`sell_signals/daily_sell_check.py`) — it lives in a sibling folder.
+if str(PROJECT_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR.parent))
 LOG_PATH = PROJECT_DIR / "results" / "daily_top10_log.csv"
 LAST_NOTIFIED_PATH = PROJECT_DIR / ".last_notified_top10.json"
 DEBOUNCE_STATE_PATH = PROJECT_DIR / ".strategy_debounce.json"
@@ -709,12 +718,72 @@ def format_email_body(r: dict) -> str:
                    f"10yr ${s.edge_10yr:>+9,}  ({s.freq_yr:.1f}/yr)")
     out.append("")
 
-    # ── 5. Footer ────────────────────────────────────────────────────────────
+    # ── 5. SELL-side block (only if there is ANY sell indication today) ──────
+    # Skip entirely on quiet HOLD days so the email stays BUY-focused.
+    sell = r.get("sell")
+    if sell and _has_sell_indication(sell):
+        out.append(format_sell_email_section(sell))
+        out.append("")
+
+    # ── 6. Footer ────────────────────────────────────────────────────────────
     out.append("─" * 72)
     out.append("  Run `python final_leaps/daily_signal_top10.py --force` for full")
     out.append("  diagnostics (all 10 strategies' condition breakdowns + 5-yr scan).")
     out.append("─" * 72)
     return "\n".join(out)
+
+
+# ─── SELL-side email section (compact) ───────────────────────────────────────
+
+def format_sell_email_section(sell: dict) -> str:
+    """One concise block summarizing today's SELL-side verdict.
+
+    Mirrors the BUY block's tight style — just the verdict + firing rules
+    + reasoning.  Full per-rule condition breakdown stays on the console.
+    """
+    icon = {"SELL": "🔴", "WATCH": "🟡", "HOLD": "🟢"}.get(sell["verdict"], "•")
+    lines = []
+    lines.append(f"  ── SELL-SIDE — {icon} {sell['verdict']} "
+                 f"({sell['n_fires']}/10 rules firing, "
+                 f"{sell['n_recommended_fired']}/2 priority) ──")
+    lines.append(f"     {sell['verdict_reason']}")
+    if sell["recommended_firing"]:
+        lines.append(f"     🔥 Priority firing: "
+                     f"{', '.join(sell['recommended_firing'])}")
+    firing = [f for f in sell["fires"] if f["fired"]]
+    if firing:
+        names = ", ".join(f["key"] for f in firing)
+        lines.append(f"     All firing rules: {names}")
+    elif sell["verdict"] == "HOLD":
+        lines.append(f"     No sell rules firing — keep open LEAPS positions.")
+    return "\n".join(lines)
+
+
+def _has_sell_indication(sell: dict | None) -> bool:
+    """True if the sell-side has anything worth surfacing in the email.
+
+    HOLD with 0 rules firing -> not worth showing.  Anything else
+    (WATCH, SELL, or even a single non-priority rule firing) -> show it.
+    """
+    if not sell:
+        return False
+    if sell.get("verdict") in ("SELL", "WATCH"):
+        return True
+    return sell.get("n_fires", 0) > 0
+
+
+def build_sell_report(df: pd.DataFrame, positions: list[dict] | None = None) -> dict | None:
+    """Build a sell-side report sharing the same SPY+VIX dataframe.
+
+    Returns None if the sell-signals package isn't importable (lets the
+    buy-side keep working stand-alone).
+    """
+    try:
+        from sell_signals.daily_sell_check import build_report as _bs
+    except Exception as e:
+        print(f"  ⚠️  Skipping sell-side (could not import sell_signals): {e}")
+        return None
+    return _bs(df, positions=positions or [])
 
 
 def should_notify_again(r: dict) -> bool:
@@ -769,50 +838,112 @@ def main():
     parser.add_argument("--scan",  type=int, default=DEFAULT_SCAN_DAYS,
                         help=f"Scan past N trading days for HIGH-CONVICTION days "
                              f"(default {DEFAULT_SCAN_DAYS}; pass 0 to disable)")
+    parser.add_argument("--no-sell", action="store_true",
+                        help="Skip the SELL-side scanner (default: both BUY and SELL "
+                             "are run + combined into a single email)")
     args = parser.parse_args()
 
     df = fetch_data(scan_days=args.scan)
+
+    # ── BUY-side ─────────────────────────────────────────────────────────────
     report = build_report(df, otm_pct=args.otm, mode=args.mode,
                           scan_days=args.scan)
-    text = format_text_report(report)
-    print(text)
     append_log(report)
 
-    should_send = (report["any_actionable"] or args.force) and not args.quiet
+    # ── SELL-side (unless --no-sell) ─────────────────────────────────────────
+    sell_report = None if args.no_sell else build_sell_report(df)
+    if sell_report is not None:
+        report["sell"] = sell_report
+        # Also print sell-side console output for parity with the old workflow
+        try:
+            from sell_signals.daily_sell_check import format_text as _ft
+            sell_console = _ft(sell_report)
+        except Exception:
+            sell_console = ""
+    else:
+        sell_console = ""
+
+    # ── Console output (BUY first, then SELL if present) ─────────────────────
+    print(format_text_report(report))
+    if sell_console:
+        print(sell_console)
+
+    # ── Decide whether to email ──────────────────────────────────────────────
+    buy_actionable  = report["any_actionable"]
+    sell_actionable = (sell_report is not None
+                       and sell_report["verdict"] in ("SELL", "WATCH"))
+    should_send = (buy_actionable or sell_actionable or args.force) and not args.quiet
     if should_send and (args.force or should_notify_again(report)):
-        subject, body = format_email_report(report)
-        short_msg = (
-            f"{report['n_fresh']} fresh strategies firing  •  "
-            f"SPY ${report['spy']:.0f}  VIX {report['vix']:.1f}\n"
-            f"Suggested: SPY ${report['contract']['strike']:.0f} "
-            f"{report['contract']['expiry']} call @ ${report['contract']['premium_mid']:.2f}/share "
-            f"(~${report['contract']['cost']:.0f}/contract)"
-            if report["any_actionable"]
-            else f"SPY ${report['spy']:.0f}  VIX {report['vix']:.1f}  — no fresh signals today."
-        )
+        subject = _combined_subject(report, sell_report)
+        body    = format_email_body(report)
+        short_msg = _combined_short_msg(report, sell_report)
+        priority = 1 if (buy_actionable or sell_actionable) else 0
         notify_all(
             title=subject,
             message=short_msg,                          # for macOS/Pushover (short)
             body=body,                                  # full detailed email body
             subtitle=f"{report['date']}  •  {report['n_fresh']}/10 fresh",
-            priority=1 if report["any_actionable"] else 0,
+            priority=priority,
         )
-        if report["any_actionable"]:
+        if buy_actionable:
             remember_notification(report)
-            # Update debounce state for each fresh fire
             if report["mode"] == "DEBOUNCED":
                 state = load_debounce_state()
                 for k in report["fresh_fires"]:
                     state[k] = report["date"]
                 save_debounce_state(state)
-    elif report["any_actionable"] and not args.force:
+    elif (buy_actionable or sell_actionable) and not args.force:
         print("  ℹ️  Already notified for this date.")
     elif args.quiet:
         print("  🔇 Quiet mode — no notification.")
     else:
-        print("  ℹ️  No strategies firing — no notification sent.")
+        print("  ℹ️  No BUY or SELL signals firing — no notification sent.")
 
     print(f"  📝 Logged to {LOG_PATH}\n")
+
+
+def _combined_subject(r: dict, sell: dict | None) -> str:
+    """Build one subject line that summarizes both BUY and SELL state."""
+    buy_part = ""
+    if r["any_actionable"]:
+        keys = ", ".join(r["fresh_fires"] if r["mode"] != "RAW"
+                         else [f["key"] for f in r["fires"] if f["fired"]])
+        n = r["n_fresh"] if r["mode"] != "RAW" else r["n_fires"]
+        flame = "🔥 HC " if r["is_high_conviction"] else "🟢 "
+        buy_part = f"{flame}BUY × {n} ({keys})"
+    else:
+        buy_part = "⚪️ BUY none"
+
+    if not _has_sell_indication(sell):
+        # No sell indication today — keep the subject BUY-only.
+        return f"SPY LEAPS — {buy_part}  •  {r['date']}"
+
+    sell_icon = {"SELL": "🔴", "WATCH": "🟡", "HOLD": "🟢"}.get(sell["verdict"], "•")
+    sell_part = f"{sell_icon} SELL {sell['verdict']}"
+    if sell["recommended_firing"]:
+        sell_part += f" ({', '.join(sell['recommended_firing'])})"
+    return f"SPY LEAPS — {buy_part}  /  {sell_part}  •  {r['date']}"
+
+
+def _combined_short_msg(r: dict, sell: dict | None) -> str:
+    """Short-form summary used for macOS toasts / Pushover (length-limited)."""
+    if r["any_actionable"]:
+        buy = (f"{r['n_fresh']} fresh BUY  •  "
+               f"SPY ${r['spy']:.0f}  VIX {r['vix']:.1f}\n"
+               f"Buy: SPY ${r['contract']['strike']:.0f} "
+               f"{r['contract']['expiry']} call @ "
+               f"${r['contract']['premium_mid']:.2f}/sh "
+               f"(~${r['contract']['cost']:.0f}/cntrct)")
+    else:
+        buy = (f"SPY ${r['spy']:.0f}  VIX {r['vix']:.1f}  — no fresh BUY signals.")
+    if not _has_sell_indication(sell):
+        return buy
+    sell_line = (f"SELL: {sell['verdict']}  "
+                 f"({sell['n_fires']}/10 rules, "
+                 f"{sell['n_recommended_fired']}/2 priority)")
+    if sell["recommended_firing"]:
+        sell_line += f"  🔥 {', '.join(sell['recommended_firing'])}"
+    return f"{buy}\n{sell_line}"
 
 
 if __name__ == "__main__":
