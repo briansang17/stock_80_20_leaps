@@ -96,15 +96,26 @@ def notify_pushover(title: str, message: str, priority: int = 0) -> bool:
         print(f"  ⚠️  Pushover failed: {e}")
         return False
 
-def notify_all(title: str, message: str, subtitle: str = "", priority: int = 0):
-    """Try every configured channel."""
+def notify_all(title: str, message: str, subtitle: str = "", priority: int = 0,
+               body: str | None = None):
+    """Try every configured channel.
+
+    Parameters
+    ----------
+    title    : email subject + push title
+    message  : short summary (used for macOS toast + Pushover, both length-limited)
+    body     : long-form email body. If None, falls back to `message`.
+    """
+    email_body = body if body is not None else message
     print(f"\n📣 SENDING NOTIFICATION")
     print(f"   Title   : {title}")
-    print(f"   Message : {message}")
+    print(f"   Summary : {message}")
+    if body is not None:
+        print(f"   Email body length: {len(body)} chars")
 
     sent = {
         "macos":    notify_macos(title, message, subtitle),
-        "email":    notify_email(title, message),
+        "email":    notify_email(title, email_body),
         "pushover": notify_pushover(title, message, priority),
     }
     for channel, ok in sent.items():

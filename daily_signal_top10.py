@@ -524,17 +524,19 @@ def main():
     should_send = (report["any_actionable"] or args.force) and not args.quiet
     if should_send and (args.force or should_notify_again(report)):
         subject, body = format_email_report(report)
+        short_msg = (
+            f"{report['n_fresh']} fresh strategies firing  •  "
+            f"SPY ${report['spy']:.0f}  VIX {report['vix']:.1f}\n"
+            f"Suggested: SPY ${report['contract']['strike']:.0f} "
+            f"{report['contract']['expiry']} call @ ${report['contract']['premium_mid']:.2f}/share "
+            f"(~${report['contract']['cost']:.0f}/contract)"
+            if report["any_actionable"]
+            else f"SPY ${report['spy']:.0f}  VIX {report['vix']:.1f}  — no fresh signals today."
+        )
         notify_all(
             title=subject,
-            message=(
-                f"{report['n_fresh']} fresh strategies firing  •  "
-                f"SPY ${report['spy']:.0f}  VIX {report['vix']:.1f}\n"
-                f"Suggested: SPY ${report['contract']['strike']:.0f} "
-                f"{report['contract']['expiry']} call @ ${report['contract']['premium_mid']:.2f}/share "
-                f"(~${report['contract']['cost']:.0f}/contract)"
-                if report["any_actionable"]
-                else f"SPY ${report['spy']:.0f}  VIX {report['vix']:.1f}  — no fresh signals today."
-            ),
+            message=short_msg,                          # for macOS/Pushover (short)
+            body=body,                                  # full detailed email body
             subtitle=f"{report['date']}  •  {report['n_fresh']}/10 fresh",
             priority=1 if report["any_actionable"] else 0,
         )
