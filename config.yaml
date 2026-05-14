@@ -1,0 +1,72 @@
+# =============================================================================
+# Hybrid VOO + Tactical LEAPS Backtest Configuration
+# =============================================================================
+# Edit any parameter here without touching the Python code.
+# All sections are read by backtest.py at runtime.
+# =============================================================================
+
+# ----- Data ------------------------------------------------------------------
+data:
+  spy_ticker: "SPY"          # SPY adjusted close as VOO proxy (longer history than VOO)
+  vix_ticker: "^VIX"
+  years: 10                   # Lookback window in years
+  start_date: null            # Optional ISO date "YYYY-MM-DD"; overrides 'years' if set
+  end_date: null              # Optional ISO date "YYYY-MM-DD"; null => today
+  cache_dir: "data_cache"     # Local CSV cache so repeated runs are instant
+
+# ----- Capital & allocation --------------------------------------------------
+portfolio:
+  starting_capital: 100000.0
+  voo_allocation: 0.80        # Buy-and-hold sleeve (80%)
+  leaps_allocation: 0.20      # Tactical sleeve (20%)
+  risk_free_rate: 0.03        # 3% annual, used in Black-Scholes
+
+# ----- Volatility scoring ----------------------------------------------------
+vol_model:
+  vix_percentile_window: 252  # Trading days for VIX percentile (~1 year)
+  realized_vol_window: 20     # 20-day realized vol of SPY
+  realized_vol_percentile_window: 252
+  vix_slope_window: 5         # 5-day change in VIX (faster signal)
+  vix_regime_window: 60       # VIX / 60-day VIX average
+  weights:
+    vix_pct: 0.45
+    realized_vol_pct: 0.35
+    slope_component: 0.20
+
+# ----- LEAPS entry signal (0-10 score) ---------------------------------------
+leaps_signal:
+  vix_pct_threshold: 70       # Bonus when VIX percentile above this
+  drawdown_min: -0.25         # Sweet-spot drawdown range (more negative = deeper)
+  drawdown_max: -0.10
+  sma_window: 20              # 20DMA stabilization filter (fast-reacting)
+  sma_proximity: 0.03         # Within +/- 3% of 20DMA counts as "near"
+  vix_slope_falling: -0.5     # 5-day VIX change <= this => falling fast (bonus)
+  vix_slope_rising: 1.0       # 5-day VIX change >= this => rising sharply (penalty)
+  new_low_window: 5           # New 5-day low penalty (faster)
+
+# ----- Allocation rules from LEAPS score -------------------------------------
+allocation_rules:
+  high_score_min: 8           # 8-10 => full sleeve
+  mid_score_min: 5            # 5-7  => half sleeve
+  high_exposure: 1.00         # Fraction of LEAPS sleeve deployed
+  mid_exposure: 0.50
+  low_exposure: 0.00
+  cash_yield: 0.03            # Annual yield on un-deployed LEAPS cash (T-bill proxy)
+
+# ----- Options / LEAPS mechanics ---------------------------------------------
+options:
+  expiry_years: 2.0           # Buy 2-year ATM calls
+  roll_remaining_years: 1.0   # Roll when 1 year remains
+  vol_term_adjust: 0.15       # sigma = (VIX/100) * (1 + 0.15 * slope_factor)
+  contract_multiplier: 100    # 1 SPY option = 100 shares
+  min_holding_days: 5         # Avoid same-day churn
+  rebalance_freq: "W"         # "D" daily, "W" weekly check of score for sizing
+  reentry_cooldown_days: 10   # Days to wait after a full exit before re-entering
+
+# ----- Outputs ---------------------------------------------------------------
+output:
+  results_dir: "results"
+  save_csv: true
+  save_plots: true
+  show_plots: false           # Set true to pop interactive windows
+  plot_dpi: 130

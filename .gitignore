@@ -1,0 +1,31 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local state (signal scripts use these to avoid duplicate emails)
+.last_notified.json
+.last_notified_top10.json
+
+# Local logs (GitHub Actions uploads its own log artifact)
+results/launchd_stdout.log
+results/launchd_stderr.log
+
+# Large local artifacts
+results/*.png
+results/*.csv
+data_cache/*.csv

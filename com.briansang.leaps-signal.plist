@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.briansang.leaps-signal</string>
+
+    <!-- Run python with the project's virtual environment.
+         Now uses daily_signal_top10.py which scans ALL 10 top strategies. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/briansang/Desktop/stock_80_20_leaps/.venv/bin/python</string>
+        <string>/Users/briansang/Desktop/stock_80_20_leaps/daily_signal_top10.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/briansang/Desktop/stock_80_20_leaps</string>
+
+    <!-- Run at 4:15pm ET Mon-Fri.
+         macOS launchd uses LOCAL time. Adjust hour if you are not in ET.
+         For 4:15pm ET on a Pacific machine, change Hour to 13. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>15</integer></dict>
+    </array>
+
+    <!-- Capture stdout/stderr for debugging -->
+    <key>StandardOutPath</key>
+    <string>/Users/briansang/Desktop/stock_80_20_leaps/results/launchd_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/briansang/Desktop/stock_80_20_leaps/results/launchd_stderr.log</string>
+
+    <!-- Ensure PATH is set so Python finds shared libs -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- If the Mac is asleep at run time, run as soon as it wakes -->
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

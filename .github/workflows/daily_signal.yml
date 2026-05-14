@@ -1,0 +1,56 @@
+name: Daily LEAPS Signal Check
+
+on:
+  schedule:
+    # Mon-Fri at 21:30 UTC = 4:30pm ET (DST) / 5:30pm ET (standard)
+    # Always runs after US market close (4pm ET) so all data is available.
+    - cron: '30 21 * * 1-5'
+  workflow_dispatch:   # allow manual trigger from GitHub UI
+    inputs:
+      force:
+        description: 'Force email even when no signals fire'
+        required: false
+        default: 'false'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run top-10 signal scanner
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO:   ${{ secrets.SMTP_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            ARGS="--force"
+          fi
+          python daily_signal_top10.py $ARGS
+
+      - name: Upload log artifact (signal history)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-signal-log
+          path: results/daily_top10_log.csv
+          retention-days: 90
+          if-no-files-found: ignore

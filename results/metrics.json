@@ -1,0 +1,86 @@
+{
+  "metrics": {
+    "VOO_only_full_capital": {
+      "start": "2016-07-25",
+      "end": "2026-05-12",
+      "years": 9.8,
+      "total_return": 2.9897,
+      "cagr": 0.1517,
+      "annual_vol": 0.1801,
+      "sharpe": 0.877,
+      "max_drawdown": -0.3372,
+      "final_value": 424334.14
+    },
+    "VOO_sleeve_80pct": {
+      "start": "2016-07-25",
+      "end": "2026-05-12",
+      "years": 9.8,
+      "total_return": 2.9897,
+      "cagr": 0.1517,
+      "annual_vol": 0.1801,
+      "sharpe": 0.877,
+      "max_drawdown": -0.3372,
+      "final_value": 319177.11
+    },
+    "LEAPS_sleeve_only": {
+      "start": "2016-07-25",
+      "end": "2026-05-12",
+      "years": 9.8,
+      "total_return": 975.7408,
+      "cagr": 1.0193,
+      "annual_vol": 0.3248,
+      "sharpe": 2.329,
+      "max_drawdown": -0.3012,
+      "final_value": 19537107.72
+    },
+    "Combined_Portfolio": {
+      "start": "2016-07-25",
+      "end": "2026-05-12",
+      "years": 9.8,
+      "total_return": 197.5582,
+      "cagr": 0.7162,
+      "annual_vol": 0.2413,
+      "sharpe": 2.365,
+      "max_drawdown": -0.2808,
+      "final_value": 19856284.84
+    }
+  },
+  "diagnostics": {
+    "num_leaps_trades": 103,
+    "avg_pct_return_per_cycle": 0.12302504101474447,
+    "median_pct_return_per_cycle": 0.10874124449626721,
+    "best_trade_pct": 0.45566568353014714,
+    "worst_trade_pct": -0.07401773597790873,
+    "avg_holding_days": 11.533980582524272,
+    "regimes": {
+      "by_volscore_quartile": {
+        "Q1_low": {
+          "mean": 0.002163,
+          "std": 0.011405,
+          "count": 616,
+          "annualized": 0.545057
+        },
+        "Q2": {
+          "mean": 0.002607,
+          "std": 0.01239,
+          "count": 615,
+          "annualized": 0.656845
+        },
+        "Q3": {
+          "mean": 0.003357,
+          "std": 0.020316,
+          "count": 616,
+          "annualized": 0.845989
+        },
+        "Q4_high": {
+          "mean": 0.003876,
+          "std": 0.031266,
+          "count": 616,
+          "annualized": 0.976748
+        }
+      },
+      "best_regime": "Q4_high",
+      "worst_regime": "Q1_low"
+    }
+  }
+}
