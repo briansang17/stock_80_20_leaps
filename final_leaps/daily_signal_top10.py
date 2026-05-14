@@ -634,8 +634,11 @@ def format_email_body(r: dict) -> str:
       2. Action block (contract + 5-step execution) if any_actionable
       3. Fired strategies with reasons (just the failed/passed conditions)
       4. Strategy ranking (10-line table)
-      5. Recent HIGH-CONVICTION days (last 5 from history, if any)
-      6. Footer with usage hints
+      5. Footer with usage hints
+
+    The 5-year HIGH-CONVICTION scan is still computed for the console
+    report (`--force` to see it) but intentionally omitted from the email
+    to keep the message tight.
     """
     out: list[str] = []
     out.append("═" * 72)
@@ -706,18 +709,7 @@ def format_email_body(r: dict) -> str:
                    f"10yr ${s.edge_10yr:>+9,}  ({s.freq_yr:.1f}/yr)")
     out.append("")
 
-    # ── 5. Recent HIGH-CONVICTION days (last 5 from history) ─────────────────
-    hist = r.get("history")
-    if hist and hist["hc_days"]:
-        recent_hc = hist["hc_days"][-5:]
-        out.append(f"  ── RECENT 🔥 HIGH-CONVICTION DAYS "
-                   f"(past {hist['days']}d, {len(hist['hc_days'])} total) ──")
-        for d in recent_hc:
-            out.append(f"     {d['date']}  SPY ${d['spy']:>4.0f}  VIX {d['vix']:>4.1f}  "
-                       f"{d['n']} agreed: {', '.join(d['fired'])}")
-        out.append("")
-
-    # ── 6. Footer ────────────────────────────────────────────────────────────
+    # ── 5. Footer ────────────────────────────────────────────────────────────
     out.append("─" * 72)
     out.append("  Run `python final_leaps/daily_signal_top10.py --force` for full")
     out.append("  diagnostics (all 10 strategies' condition breakdowns + 5-yr scan).")
