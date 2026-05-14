@@ -78,6 +78,10 @@ DEBOUNCE_STATE_PATH = PROJECT_DIR / ".strategy_debounce.json"
 DEFAULT_OTM = 0.15
 DEBOUNCE_DAYS = 1            # only suppress same-day duplicates per strategy
 HIGH_CONVICTION_FRESH = 3    # ≥3 fresh fires same day = "🔥 HIGH CONVICTION"
+# Super-HC = HC + the anchor strategy fires too.  Per the back-test (see
+# final_leaps/graphs/tier_SHC_A+any2_*.png) requiring A_CHEAP_IV pushes
+# 10-yr win rate from 78% to 82% and 2-yr win rate from 89% to 100%.
+SUPER_HC_ANCHOR = "A_CHEAP_IV"
 DEFAULT_SCAN_DAYS = 1260     # past N trading days scanned for HC days (~5 years)
 
 
@@ -386,6 +390,12 @@ def build_report(df: pd.DataFrame, otm_pct: float, mode: str = "DEBOUNCED",
         any_actionable = n_fresh > 0
 
     is_high_conviction = n_fresh >= HIGH_CONVICTION_FRESH
+    # Super-HC = HC + the anchor strategy is among the fresh fires (or, in
+    # RAW mode, among today's fires).  Per back-test this jumps win rate
+    # +4pp and shrinks worst-case loss from -67% to -37%.
+    consider_fires = fresh_fires if mode != "RAW" else [f["key"] for f in fires if f["fired"]]
+    is_super_high_conviction = (is_high_conviction
+                                and SUPER_HC_ANCHOR in consider_fires)
 
     history = build_history_scan(feats, sigs, scan_days) if scan_days > 0 else None
 
@@ -403,6 +413,7 @@ def build_report(df: pd.DataFrame, otm_pct: float, mode: str = "DEBOUNCED",
         "any_fired": n_fires > 0,
         "any_actionable": any_actionable,
         "is_high_conviction": is_high_conviction,
+        "is_super_high_conviction": is_super_high_conviction,
         "n_fires": n_fires,
         "n_fresh": n_fresh,
         "contract": contract,
@@ -446,7 +457,14 @@ def format_text_report(r: dict) -> str:
     if r["any_actionable"]:
         c = r["contract"]
         out.append("  " + "─" * 68)
-        if r["is_high_conviction"]:
+        if r.get("is_super_high_conviction"):
+            out.append(f"  🔥🔥 SUPER HIGH CONVICTION DAY — {r['n_fresh']} strategies agree,")
+            out.append(f"        anchor {SUPER_HC_ANCHOR} is among them!")
+            out.append(f"     (HC + {SUPER_HC_ANCHOR} fires — past 10 yrs: ~82% win rate,")
+            out.append(f"      2-yr window: 100% win rate; cheap-IV setups limit worst case)")
+            out.append(f"     → Consider 2 contracts instead of 1 if portfolio supports it")
+            out.append("  " + "─" * 68)
+        elif r["is_high_conviction"]:
             out.append(f"  🔥 HIGH CONVICTION DAY — {r['n_fresh']} strategies agree!")
             out.append(f"     (≥3 independent strategies firing same day — past 10 yrs of these")
             out.append(f"      averaged +44% per LEAPS trade, 88% win rate)")
@@ -620,12 +638,22 @@ def build_history_scan(feats: pd.DataFrame, sigs: pd.DataFrame,
 
 
 def format_email_report(r: dict) -> tuple[str, str]:
-    """Returns (subject, body) for email — concise, action-first."""
+    """Returns (subject, body) for email — concise, action-first.
+
+    Three tiers (per the two-tier thesis + standard buy):
+      🔥🔥 SUPER HIGH CONVICTION  →  HC + the SUPER_HC_ANCHOR strategy fires
+      🔥    HIGH CONVICTION         →  ≥HIGH_CONVICTION_FRESH strategies fire
+      🟢    BUY                     →  ≥1 fresh strategy fires
+      ⚪️    no signal               →  nothing fresh
+    """
     if r["any_actionable"]:
         n = r["n_fresh"] if r["mode"] != "RAW" else r["n_fires"]
         fired_keys = ", ".join(r["fresh_fires"] if r["mode"] != "RAW"
                                else [f["key"] for f in r["fires"] if f["fired"]])
-        if r["is_high_conviction"]:
+        if r.get("is_super_high_conviction"):
+            subject = (f"🔥🔥 SUPER HIGH CONVICTION — {n} SPY LEAPS signals "
+                       f"incl. {SUPER_HC_ANCHOR} ({fired_keys})")
+        elif r["is_high_conviction"]:
             subject = f"🔥 HIGH CONVICTION — {n} SPY LEAPS signals agree ({fired_keys})"
         else:
             subject = f"🟢 SPY LEAPS — {n} signal{'s' if n != 1 else ''} firing ({fired_keys})"
@@ -656,7 +684,10 @@ def format_email_body(r: dict) -> str:
     out.append("")
 
     # ── 1. Verdict + market snapshot ─────────────────────────────────────────
-    if r["is_high_conviction"]:
+    if r.get("is_super_high_conviction"):
+        verdict = (f"🔥🔥 SUPER HIGH CONVICTION BUY — {r['n_fresh']} strategies "
+                   f"agree (incl. anchor {SUPER_HC_ANCHOR})")
+    elif r["is_high_conviction"]:
         verdict = f"🔥 HIGH CONVICTION BUY — {r['n_fresh']} strategies agree"
     elif r["any_actionable"]:
         verdict = f"🟢 BUY — {r['n_fresh']} fresh signal{'s' if r['n_fresh'] != 1 else ''} firing"
@@ -909,7 +940,12 @@ def _combined_subject(r: dict, sell: dict | None) -> str:
         keys = ", ".join(r["fresh_fires"] if r["mode"] != "RAW"
                          else [f["key"] for f in r["fires"] if f["fired"]])
         n = r["n_fresh"] if r["mode"] != "RAW" else r["n_fires"]
-        flame = "🔥 HC " if r["is_high_conviction"] else "🟢 "
+        if r.get("is_super_high_conviction"):
+            flame = "🔥🔥 SHC "
+        elif r["is_high_conviction"]:
+            flame = "🔥 HC "
+        else:
+            flame = "🟢 "
         buy_part = f"{flame}BUY × {n} ({keys})"
     else:
         buy_part = "⚪️ BUY none"
@@ -928,7 +964,13 @@ def _combined_subject(r: dict, sell: dict | None) -> str:
 def _combined_short_msg(r: dict, sell: dict | None) -> str:
     """Short-form summary used for macOS toasts / Pushover (length-limited)."""
     if r["any_actionable"]:
-        buy = (f"{r['n_fresh']} fresh BUY  •  "
+        if r.get("is_super_high_conviction"):
+            tier = "🔥🔥 SHC"
+        elif r["is_high_conviction"]:
+            tier = "🔥 HC"
+        else:
+            tier = "🟢"
+        buy = (f"{tier} {r['n_fresh']} fresh BUY  •  "
                f"SPY ${r['spy']:.0f}  VIX {r['vix']:.1f}\n"
                f"Buy: SPY ${r['contract']['strike']:.0f} "
                f"{r['contract']['expiry']} call @ "
