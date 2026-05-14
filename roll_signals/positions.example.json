@@ -1,0 +1,18 @@
+[
+  {
+    "description":   "Example LEAPS lot — replace with your own",
+    "entry_date":    "2025-04-08",
+    "expiry":        "2027-04-08",
+    "strike":        540,
+    "entry_premium": 75.40,
+    "contracts":     1
+  },
+  {
+    "description":   "Second example lot",
+    "entry_date":    "2025-07-15",
+    "expiry":        "2027-07-15",
+    "strike":        620,
+    "entry_premium": 82.10,
+    "contracts":     1
+  }
+]
