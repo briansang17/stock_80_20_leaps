@@ -15,6 +15,8 @@ cheap-IV super → 🔥🔥🔥 **Elite** when HC includes **both** anchors.
 In addition, every email appends a "33-YR SWEEP TOP-5 PER WINDOW" block
 showing the top-5 rules for the 1/2/5/10/30-year windows (from
 `results/heuristics_sweep_filtered.csv`) and which of them fire today.
+Win-% cells fall back to committed `sweep_win_rate_bundle.csv` when
+`results/heuristics_sweep*.csv` are absent (CI / fresh clone).
 
 Strategies are ordered by **10-year after-tax edge** from the sweep CSVs
 (`results/heuristics_sweep*.csv`) when a matching `sweep_rule` row exists,
@@ -178,38 +180,48 @@ STRATEGIES: list[StrategyDef] = [
 
 # ─── Sweep CSV → win% ladder (for email) + 10y metrics (for ranking) ─────────
 SWEEP_CSV_RAW = PROJECT_DIR / "results" / "heuristics_sweep.csv"
+# Shipped snapshot so CI / fresh clones still show win-% (gitignored `results/*.csv`).
+SWEEP_WIN_RATE_BUNDLE = PROJECT_DIR / "sweep_win_rate_bundle.csv"
 _SWEEP_WIN_LUT: dict[str, dict[int, int]] | None = None
 # rule → {edge, win_rate?, freq_yr?} from window_yr == 10 (merged raw then filtered)
 _SWEEP_10Y_METRICS: dict[str, dict[str, float | int]] | None = None
+# True when only the bundle supplied win% (no local results/*.csv sweep files).
+_SWEEP_WIN_BUNDLE_FALLBACK: bool = False
 RANK_WINDOW_YR = 10
 
 
 def sweep_win_by_window() -> dict[str, dict[int, int]]:
     """rule_name → {window_yr → win_rate %} from sweep CSVs.
 
-    Unfiltered `heuristics_sweep.csv` is read first, then
-    `heuristics_sweep_filtered.csv` overwrites so dense windows match the
-    filtered leaderboard while long windows (e.g. A_grid 10y/30y) still appear
-    when only the raw sweep has rows.
+    Load order (each overwrites the same ``rule`` / ``window_yr`` cell):
 
-    Also fills `_SWEEP_10Y_METRICS` for ``window_yr == RANK_WINDOW_YR`` so
-    strategy ranking / fire-line stats track the latest sweep numbers.
+    1. ``sweep_win_rate_bundle.csv`` next to this script (committed snapshot for CI).
+    2. ``results/heuristics_sweep.csv`` (full sweep).
+    3. ``results/heuristics_sweep_filtered.csv`` (density-filtered leaderboard).
+
+    Also fills `_SWEEP_10Y_METRICS` for ``window_yr == RANK_WINDOW_YR`` when those
+    rows include ``edge_aftertax`` (bundle rows do not — ranking falls back to
+    static ``StrategyDef`` fields until a real sweep CSV exists).
     """
-    global _SWEEP_WIN_LUT, _SWEEP_10Y_METRICS
+    global _SWEEP_WIN_LUT, _SWEEP_10Y_METRICS, _SWEEP_WIN_BUNDLE_FALLBACK
     if _SWEEP_WIN_LUT is not None:
         return _SWEEP_WIN_LUT
     lut: dict[str, dict[int, int]] = {}
     m10: dict[str, dict[str, float | int]] = {}
     flt = PROJECT_DIR / "results" / "heuristics_sweep_filtered.csv"
-    for path in (SWEEP_CSV_RAW, flt):
-        if not path.exists():
-            continue
+    paths = [p for p in (SWEEP_WIN_RATE_BUNDLE, SWEEP_CSV_RAW, flt) if p.exists()]
+    _SWEEP_WIN_BUNDLE_FALLBACK = (
+        SWEEP_WIN_RATE_BUNDLE.exists()
+        and not SWEEP_CSV_RAW.exists()
+        and not flt.exists()
+    )
+    for path in paths:
         df = pd.read_csv(path)
         has_tpy = "trades_per_yr" in df.columns
         for _, r in df.iterrows():
             k = str(r["rule"])
             w = int(float(r["window_yr"]))
-            wr = r["win_rate"]
+            wr = r.get("win_rate")
             if wr is None or (isinstance(wr, float) and pd.isna(wr)):
                 pass
             else:
@@ -281,6 +293,12 @@ def format_win_rate_matrix_lines(r: dict) -> list[str]:
         c = [_win_pct_cell(d, w) for w in (1, 2, 5, 10, 30)]
         lines.append(f"     {s.key:<{W}}   {tc}  " + " ".join(c))
     lines.append("")
+    if not lut:
+        lines.append("     ⚠️  No sweep win-% data: add `sweep_win_rate_bundle.csv` (repo) or")
+        lines.append("        `results/heuristics_sweep*.csv` from `python final_leaps/heuristics_sweep.py`.")
+    elif _SWEEP_WIN_BUNDLE_FALLBACK:
+        lines.append("     ℹ️  Win % uses committed `sweep_win_rate_bundle.csv` (snapshot).")
+        lines.append("        Local `results/heuristics_sweep*.csv` overrides when present.")
     lines.append("     T   * = strategy conditions TRUE today (counts toward tiers / email)")
     lines.append("         - = not firing today")
     lines.append("     🔥 High conviction (HC) = ≥3 different strategies with * same day.")
