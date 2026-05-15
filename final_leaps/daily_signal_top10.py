@@ -71,8 +71,15 @@ from strategy_alternatives import (
     rule_H_trend_follow, rule_I_bb_squeeze,
     rule_L_squeeze_or_current, rule_M_quality_breakout, rule_N_filter_current,
 )
-# Sweep-aligned rules (same `make_rule` gates as heuristics_sweep.py).
-from heuristics_sweep import make_rule, build_rules as _build_sweep_rules
+# Sweep-aligned rules (same `make_rule` gates as heuristics_sweep.build_rules).
+from sweep_rule_builder import make_rule
+
+try:
+    from heuristics_sweep import build_rules as _build_sweep_rules
+except ImportError:
+    def _build_sweep_rules():
+        """Fallback when `heuristics_sweep.py` is not in the checkout (e.g. CI)."""
+        return []
 
 rule_K_fear_unwind   = make_rule(move_crush_min=0.20, require_move_falling=True,
                                   require_above_200dma=True, vix_max=30)
