@@ -122,7 +122,11 @@ def build_report(df: pd.DataFrame, positions: list[dict] | None = None) -> dict:
 
 # ─── Format text ──────────────────────────────────────────────────────────────
 
-def format_text(r: dict) -> str:
+def format_text(r: dict, compact: bool = False) -> str:
+    """Format full console report. With ``compact=True`` and verdict HOLD with
+    no rules firing, omit the long per-rule breakdown (used from the combined
+    BUY+SELL daily runner).
+    """
     out = []
     out.append("═" * 72)
     out.append(f"  SPY LEAPS — SELL-SIGNAL SCANNER  •  {r['date']}")
@@ -169,11 +173,22 @@ def format_text(r: dict) -> str:
             out.append(f"     ✅ Today's verdict is {r['verdict']} — keep these open")
         out.append("")
 
+    quiet_hold = (
+        compact
+        and r["verdict"] == "HOLD"
+        and r["n_fires"] == 0
+    )
+
     # Per-rule breakdown
     firing = [f for f in r["fires"] if f["fired"]]
     not_firing = [f for f in r["fires"] if not f["fired"]]
 
-    if firing:
+    if quiet_hold:
+        out.append("  ── Sell rules ──")
+        out.append("     Quiet HOLD (0/10 firing) — per-rule detail omitted here.")
+        out.append("     Run:  python sell_signals/daily_sell_check.py")
+        out.append("")
+    elif firing:
         out.append("  🔴 SELL RULES FIRING")
         out.append("  " + "─" * 68)
         for f in firing:
@@ -184,7 +199,7 @@ def format_text(r: dict) -> str:
                 out.append(f"       {c}")
             out.append("")
 
-    if not_firing:
+    if not_firing and not quiet_hold:
         out.append("  ── Not firing today (how close they are) ──")
         out.append("")
         for f in not_firing:

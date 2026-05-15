@@ -1,28 +1,29 @@
 """
-Daily Signal Monitor — Top 10 Strategies
-=========================================
+Daily Signal Monitor — baseline + sweep-winner strategies
+=========================================================
 
-Runs all 10 winning strategies daily and sends ONE email per day when any
-of them fire.  The email lists which strategy(ies) flagged, why (each
-condition with current values), and the exact LEAPS contract to buy.
+Runs 14 BUY heuristics and emails when your `--mode` gate passes.  The body
+includes a **win-% matrix** (1y–30y) and **tiers** when several heuristics
+agree (long-grid anchor vs cheap-IV anchor — see `ANCHOR_LONG_GRID`).
 
-Strategies are ordered by **10-year after-tax edge** (biggest $$ first)
-and **renamed A→J to match the rank** (A_ = best, J_ = worst).
-Win rate and edge figures come from `FINAL_STRATEGY.md` backtests
-(+15% OTM 2-yr LEAPS, rotation model, 2016-2026 SPY+VIX).
+**Frequent email:** `--mode FREQUENT` (alias of `RAW`, ~151/yr — any strategy
+firing).  Add `--repeat-daily` for more than one email per calendar day.
+
+**Tiers:** 🟢 1 strategy firing → 🟡 2 → 🔥 ≥3 (HC) → 🔥🔥 long-grid super /
+cheap-IV super → 🔥🔥🔥 **Elite** when HC includes **both** anchors.
+
+In addition, every email appends a "33-YR SWEEP TOP-5 PER WINDOW" block
+showing the top-5 rules for the 1/2/5/10/30-year windows (from
+`results/heuristics_sweep_filtered.csv`) and which of them fire today.
+
+Strategies are ordered by **10-year after-tax edge** from the sweep CSVs
+(`results/heuristics_sweep*.csv`) when a matching `sweep_rule` row exists,
+otherwise the static figures baked into `STRATEGIES`.
 
     Rank  Strategy           Win%   10yr edge $   Fires/yr  Idea
     ────  ─────────────────  ────   ───────────   ────────  ──────────────────
      1.   A_CHEAP_IV         82%    +$390,073      8.0      VIX<16 + RSI sweet spot
-     2.   B_TREND_FOLLOW     74%    +$378,454     11.6      50>200DMA + MACD>0
-     3.   C_BREAKOUT         81%    +$372,959      8.1      New 60-day high
-     4.   D_QUAL_BREAKOUT    79%    +$341,693      5.8      Breakout + VIX<18
-     5.   E_A_OR_SQUEEZE     77%    +$181,197      4.3      Momentum OR squeeze
-     6.   F_VIX_CRUSH        68%    +$132,260      2.8      VIX -30% in 10d
-     7.   G_BB_SQUEEZE       78%    +$114,301      2.3      BB squeeze breakout
-     8.   H_CURRENT          70%     +$64,727      2.3      2-of-3 momentum
-     9.   I_FILTER_CURR      75%     +$63,826      1.6      H_CURRENT + extra filters
-    10.   J_OVERSOLD         71%     +$58,465      2.8      RSI<35 in uptrend
+     …    (+ sweep-tagged rows N/L/K/M, etc.)
 
 Historical scan default: 1,260 trading days ≈ 5 years.
 
@@ -31,13 +32,17 @@ same process so BOTH BUY and SELL verdicts are combined into ONE email.
 Pass `--no-sell` to keep the email BUY-only.
 
 Usage:
-  python daily_signal_top10.py                # BUY + SELL combined email
-  python daily_signal_top10.py --no-sell      # BUY only (legacy behaviour)
+  python daily_signal_top10.py --mode FREQUENT     # frequent: email on any firing
+  python daily_signal_top10.py --mode FREQUENT --repeat-daily   # intraday repeats
+  python daily_signal_top10.py                # default DEBOUNCED (~150+ firing days/yr)
+  python daily_signal_top10.py --no-sell      # BUY only
   python daily_signal_top10.py --force        # email even with no fires
-  python daily_signal_top10.py --quiet        # just print, no email
-  python daily_signal_top10.py --otm 0.15     # change OTM target (default 15%)
-  python daily_signal_top10.py --scan 252     # use 1-year scan instead of 5y
-  python daily_signal_top10.py --scan 0       # disable historical scan
+  python daily_signal_top10.py --reset-notify-state   # clear date de-dupe, then run
+  python daily_signal_top10.py --repeat-daily # allow a 2nd email same calendar day
+  python daily_signal_top10.py --quiet        # print only, no email
+  python daily_signal_top10.py --otm 0.15     # OTM target (default 15%)
+  python daily_signal_top10.py --scan 252     # 1-year HC scan window
+  python daily_signal_top10.py --scan 0      # disable historical scan
 """
 
 from __future__ import annotations
@@ -66,6 +71,19 @@ from strategy_alternatives import (
     rule_H_trend_follow, rule_I_bb_squeeze,
     rule_L_squeeze_or_current, rule_M_quality_breakout, rule_N_filter_current,
 )
+# Sweep-aligned rules (same `make_rule` gates as heuristics_sweep.py).
+from heuristics_sweep import make_rule, build_rules as _build_sweep_rules
+
+rule_K_fear_unwind   = make_rule(move_crush_min=0.20, require_move_falling=True,
+                                  require_above_200dma=True, vix_max=30)
+rule_L_oversold_deep = make_rule(rsi_max=30, require_above_200dma=True,
+                                  vix_max=28)
+rule_M_bb_tight      = make_rule(bb_width_max=0.15, require_bb_upper=True,
+                                  require_above_200dma=True, vix_max=18)
+rule_N_a_grid_vix14_rsi65 = make_rule(
+    vix_max=14, rsi_min=40, rsi_max=65,
+    require_above_50dma=True, require_above_200dma=True,
+)
 
 PROJECT_DIR = Path(__file__).resolve().parent
 # Repo root needs to be on sys.path so we can import the sell-side scanner
@@ -74,15 +92,18 @@ if str(PROJECT_DIR.parent) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR.parent))
 LOG_PATH = PROJECT_DIR / "results" / "daily_top10_log.csv"
 LAST_NOTIFIED_PATH = PROJECT_DIR / ".last_notified_top10.json"
-DEBOUNCE_STATE_PATH = PROJECT_DIR / ".strategy_debounce.json"
 DEFAULT_OTM = 0.15
-DEBOUNCE_DAYS = 1            # only suppress same-day duplicates per strategy
-HIGH_CONVICTION_FRESH = 3    # ≥3 fresh fires same day = "🔥 HIGH CONVICTION"
-# Super-HC = HC + the anchor strategy fires too.  Per the back-test (see
-# final_leaps/graphs/tier_SHC_A+any2_*.png) requiring A_CHEAP_IV pushes
-# 10-yr win rate from 78% to 82% and 2-yr win rate from 89% to 100%.
-SUPER_HC_ANCHOR = "A_CHEAP_IV"
+HIGH_CONVICTION_FRESH = 3    # ≥3 strategies firing same day = "🔥 HIGH CONVICTION"
+# Tier anchors (see 33-yr sweep win % matrix in email):
+#   N_A_GRID… = VIX<14 + RSI 40–65 — strongest *long* horizon stats in the sweep.
+#   A_CHEAP_IV = classic cheap-VIV + RSI band — historic SHC anchor.
+ANCHOR_LONG_GRID = "N_A_GRID_VIX14_RSI65"
+SUPER_HC_ANCHOR = "A_CHEAP_IV"   # kept for backward-compatible constant name
 DEFAULT_SCAN_DAYS = 1260     # past N trading days scanned for HC days (~5 years)
+# Console history: list only the newest HC days (full counts unchanged below).
+HC_HISTORY_DISPLAY_MAX = 25
+# Email: show sweep top-5 only for these windows (shorter than 1/2/5/10/30).
+EMAIL_SWEEP_WINDOWS = [10, 30]
 
 
 @dataclass(frozen=True)
@@ -94,63 +115,222 @@ class StrategyDef:
     win_rate: int       # historical win % at +15% OTM 2-yr LEAPS
     edge_10yr: int      # after-tax $$ edge over pure VOO DCA, 10-yr
     layman: str         # plain-English description for the email body
+    sweep_rule: str | None = None   # CSV `rule` id for 33-yr sweep win% (every email strategy)
 
 
-# Ordered by 10-year after-tax edge (biggest $$ first).  Public keys are
-# renamed A→J so the prefix letter matches the rank (A_=best, J_=worst).
-# The python rule_* function names from strategy_alternatives.py are kept
-# intact (they are internal-only).
-# Numbers from FINAL_STRATEGY.md  ($2,500/mo VOO DCA + rotation model).
+# Ordered by 10-year after-tax edge (biggest $$ first).
+# Baseline figures from FINAL_STRATEGY.md; sweep rows use heuristics_sweep*.csv.
 STRATEGIES: list[StrategyDef] = [
     StrategyDef("A_CHEAP_IV",       rule_C_cheap_iv,           8.0, 82, 390_073,
-                "Options are cheap (VIX<16) and trend intact"),
+                "Options are cheap (VIX<16) and trend intact",
+                sweep_rule="orig.C_CHEAP_IV"),
     StrategyDef("B_TREND_FOLLOW",   rule_H_trend_follow,      11.6, 74, 378_454,
-                "Trending uptrend with MACD bullish"),
+                "Trending uptrend with MACD bullish",
+                sweep_rule="orig.H_TREND_FOLLOW"),
     StrategyDef("C_BREAKOUT",       rule_D_breakout,           8.1, 81, 372_959,
-                "SPY hit new 60-day high with VIX still low"),
+                "SPY hit new 60-day high with VIX still low",
+                sweep_rule="orig.D_BREAKOUT"),
     StrategyDef("D_QUAL_BREAKOUT",  rule_M_quality_breakout,   5.8, 79, 341_693,
-                "Quality breakout: 60d high + very low VIX + clean uptrend"),
+                "Quality breakout: 60d high + very low VIX + clean uptrend",
+                sweep_rule="orig.M_QUAL_BREAKOUT"),
     StrategyDef("E_A_OR_SQUEEZE",   rule_L_squeeze_or_current, 4.3, 77, 181_197,
-                "Momentum entry (H_CURRENT) OR Bollinger squeeze breakout"),
+                "Momentum entry (H_CURRENT) OR Bollinger squeeze breakout",
+                sweep_rule="orig.L_A_OR_SQUEEZE"),
     StrategyDef("F_VIX_CRUSH",      rule_F_vix_crush,          2.8, 68, 132_260,
-                "Fear collapsed: VIX dropped 30%+ in 10 days"),
+                "Fear collapsed: VIX dropped 30%+ in 10 days",
+                sweep_rule="orig.F_VIX_CRUSH"),
     StrategyDef("G_BB_SQUEEZE",     rule_I_bb_squeeze,         2.3, 78, 114_301,
-                "Bollinger Band squeeze + breakout"),
+                "Bollinger Band squeeze + breakout",
+                sweep_rule="orig.I_BB_SQUEEZE"),
+    StrategyDef("L_OVERSOLD_DEEP",  rule_L_oversold_deep,      2.2, 68,  85_155,
+                "Oversold RSI<30 + VIX<28 + SPY>200DMA (sweep oversold.RSI<30.VIX<28).",
+                sweep_rule="oversold.RSI<30.VIX<28"),
+    StrategyDef("M_BB_TIGHT",       rule_M_bb_tight,           2.0, 85,  69_504,
+                "Volatility-squeeze breakout: BB-width <15%ile + SPY at upper "
+                "band + VIX<18",
+                sweep_rule="squeeze.BB<0.15.VIX<18"),
     StrategyDef("H_CURRENT",        rule_A_current,            2.3, 70,  64_727,
-                "2-of-3 momentum signals fired + filters pass"),
+                "2-of-3 momentum signals fired + filters pass",
+                sweep_rule="orig.A_CURRENT"),
     StrategyDef("I_FILTER_CURR",    rule_N_filter_current,     1.6, 75,  63_826,
-                "Strict momentum entry (H_CURRENT + extra VIX/MACD filters)"),
+                "Strict momentum entry (H_CURRENT + extra VIX/MACD filters)",
+                sweep_rule="orig.N_FILTER_CURR"),
+    StrategyDef("N_A_GRID_VIX14_RSI65", rule_N_a_grid_vix14_rsi65, 6.0, 80,  58_591,
+                "Cheap-IV grid: VIX<14, RSI 40–65, SPY above 50 & 200DMA "
+                "(sweep A_grid.VIX<14.RSI<65).",
+                sweep_rule="A_grid.VIX<14.RSI<65"),
     StrategyDef("J_OVERSOLD",       rule_E_oversold_uptrend,   2.8, 71,  58_465,
-                "Oversold dip in established uptrend (RSI<35)"),
+                "Oversold dip in established uptrend (RSI<35)",
+                sweep_rule="orig.E_OVERSOLD"),
+    StrategyDef("K_FEAR_UNWIND",    rule_K_fear_unwind,        1.7, 82,  54_366,
+                "MOVE fear unwind: ≥20% MOVE crush in 10d + falling + uptrend "
+                "(sweep move.fear_unwind).",
+                sweep_rule="move.fear_unwind"),
 ]
+
+
+# ─── Sweep CSV → win% ladder (for email) + 10y metrics (for ranking) ─────────
+SWEEP_CSV_RAW = PROJECT_DIR / "results" / "heuristics_sweep.csv"
+_SWEEP_WIN_LUT: dict[str, dict[int, int]] | None = None
+# rule → {edge, win_rate?, freq_yr?} from window_yr == 10 (merged raw then filtered)
+_SWEEP_10Y_METRICS: dict[str, dict[str, float | int]] | None = None
+RANK_WINDOW_YR = 10
+
+
+def sweep_win_by_window() -> dict[str, dict[int, int]]:
+    """rule_name → {window_yr → win_rate %} from sweep CSVs.
+
+    Unfiltered `heuristics_sweep.csv` is read first, then
+    `heuristics_sweep_filtered.csv` overwrites so dense windows match the
+    filtered leaderboard while long windows (e.g. A_grid 10y/30y) still appear
+    when only the raw sweep has rows.
+
+    Also fills `_SWEEP_10Y_METRICS` for ``window_yr == RANK_WINDOW_YR`` so
+    strategy ranking / fire-line stats track the latest sweep numbers.
+    """
+    global _SWEEP_WIN_LUT, _SWEEP_10Y_METRICS
+    if _SWEEP_WIN_LUT is not None:
+        return _SWEEP_WIN_LUT
+    lut: dict[str, dict[int, int]] = {}
+    m10: dict[str, dict[str, float | int]] = {}
+    flt = PROJECT_DIR / "results" / "heuristics_sweep_filtered.csv"
+    for path in (SWEEP_CSV_RAW, flt):
+        if not path.exists():
+            continue
+        df = pd.read_csv(path)
+        has_tpy = "trades_per_yr" in df.columns
+        for _, r in df.iterrows():
+            k = str(r["rule"])
+            w = int(float(r["window_yr"]))
+            wr = r["win_rate"]
+            if wr is None or (isinstance(wr, float) and pd.isna(wr)):
+                pass
+            else:
+                lut.setdefault(k, {})[w] = int(round(float(wr)))
+            if w == RANK_WINDOW_YR:
+                rec = m10.setdefault(k, {})
+                ea = r.get("edge_aftertax")
+                if ea is not None and not (isinstance(ea, float) and pd.isna(ea)):
+                    rec["edge"] = int(round(float(ea)))
+                if wr is not None and not (isinstance(wr, float) and pd.isna(wr)):
+                    rec["win_rate"] = int(round(float(wr)))
+                if has_tpy:
+                    tpy = r.get("trades_per_yr")
+                    if tpy is not None and not (isinstance(tpy, float) and pd.isna(tpy)):
+                        rec["freq_yr"] = float(tpy)
+    _SWEEP_WIN_LUT = lut
+    _SWEEP_10Y_METRICS = m10
+    return _SWEEP_WIN_LUT
+
+
+def strategy_display_metrics(s: StrategyDef) -> tuple[int, int, float]:
+    """Return (10y edge $, win %, fires/yr) for ranking and copy.
+
+    Prefer the ``RANK_WINDOW_YR`` row for ``s.sweep_rule`` in the merged sweep
+    tables; fall back to static ``StrategyDef`` fields when the CSV has no row.
+    """
+    sweep_win_by_window()
+    rule = s.sweep_rule or ""
+    rec = (_SWEEP_10Y_METRICS or {}).get(rule, {})
+    if rec.get("edge") is not None:
+        edge = int(rec["edge"])
+        wr = int(rec["win_rate"]) if rec.get("win_rate") is not None else s.win_rate
+        fq = float(rec["freq_yr"]) if rec.get("freq_yr") is not None else s.freq_yr
+        return edge, wr, fq
+    return s.edge_10yr, s.win_rate, s.freq_yr
+
+
+def strategies_sorted_by_sweep_10y() -> list[StrategyDef]:
+    """All ``STRATEGIES`` ordered by current 10-yr sweep edge (largest first)."""
+    return sorted(STRATEGIES, key=lambda s: -strategy_display_metrics(s)[0])
+
+
+def _win_pct_cell(d: dict[int, int], w: int, width: int = 4) -> str:
+    """Right-align a win% or em-dash for missing window."""
+    if w not in d:
+        return "—".rjust(width)
+    return f"{d[w]}%".rjust(width)
+
+
+def format_win_rate_matrix_lines(r: dict) -> list[str]:
+    """Compact one-screen table: 1y–30y win % + today's fire markers + HC hint."""
+    lut = sweep_win_by_window()
+    by_key = {f["key"]: f for f in r["fires"]}
+    ordered = strategies_sorted_by_sweep_10y()
+    W = 22
+    lines: list[str] = []
+    lines.append("  ── WIN % AT A GLANCE (33-yr sweep vs VOO DCA) ──")
+    lines.append("     Each cell = % of back-tested trades beating VOO in that look-back.")
+    lines.append(f"     {'Strategy':<{W}}   T    1y   2y   5y  10y  30y")
+    lines.append("     " + "─" * 62)
+    for s in ordered:
+        d = lut.get(s.sweep_rule or "", {})
+        fk = by_key.get(s.key)
+        if fk and fk.get("fired"):
+            raw = "*"
+        else:
+            raw = "-"
+        tc = f"{raw:^3}"
+        c = [_win_pct_cell(d, w) for w in (1, 2, 5, 10, 30)]
+        lines.append(f"     {s.key:<{W}}   {tc}  " + " ".join(c))
+    lines.append("")
+    lines.append("     T   * = strategy conditions TRUE today (counts toward tiers / email)")
+    lines.append("         - = not firing today")
+    lines.append("     🔥 High conviction (HC) = ≥3 different strategies with * same day.")
+    lines.append(f"     🔥🔥 Long-grid super = HC + {ANCHOR_LONG_GRID} (best 30y sweep row).")
+    lines.append(f"     🔥🔥 Super (cheap IV) = HC + {SUPER_HC_ANCHOR} only (classic SHC).")
+    lines.append(f"     🔥🔥🔥 Elite = HC + both {ANCHOR_LONG_GRID} + {SUPER_HC_ANCHOR}.")
+    if r.get("is_elite_conviction"):
+        lines.append(f"     ➜ TODAY: 🔥🔥🔥 ELITE HC ({r['n_fresh']} *)")
+    elif r.get("is_long_grid_super"):
+        lines.append(f"     ➜ TODAY: 🔥🔥 LONG-GRID SUPER HC — {r['n_fresh']} * incl. "
+                     f"{ANCHOR_LONG_GRID}")
+    elif r.get("is_super_high_conviction"):
+        lines.append(f"     ➜ TODAY: 🔥🔥 SUPER HC (cheap IV) — {r['n_fresh']} * incl. "
+                     f"{SUPER_HC_ANCHOR}")
+    elif r.get("is_high_conviction"):
+        lines.append(f"     ➜ TODAY: 🔥 HIGH CONVICTION — {r['n_fresh']} firing: "
+                     f"{', '.join(r['fresh_fires'])}")
+    elif r.get("is_strong_conviction"):
+        lines.append(f"     ➜ TODAY: 🟡 STRONG (2 heuristics): {', '.join(r['fresh_fires'])}")
+    elif r.get("n_fresh", 0) > 0:
+        lines.append(f"     ➜ TODAY: {r['n_fresh']} heuristic(s) firing: {', '.join(r['fresh_fires'])}")
+    return lines
 
 
 # ─── Data ────────────────────────────────────────────────────────────────────
 
 def fetch_data(scan_days: int = 0) -> pd.DataFrame:
-    """Fetch SPY + VIX from Yahoo Finance.
+    """Fetch SPY + VIX + MOVE from Yahoo Finance.
 
     Need ≥252 days for BB-percentile + an extra buffer for whatever
-    --scan window the user requested.
+    --scan window the user requested.  MOVE (^MOVE = ICE BofA Treasury-bond
+    vol) is optional — if Yahoo doesn't return it, we degrade gracefully
+    (MOVE-based rules just won't fire).
     """
-    period_days = max(500, 380 + int(scan_days * 1.5))   # ~1.5 cal/trading
-    print(f"  📡 Fetching SPY + VIX from Yahoo Finance ({period_days}d)...")
+    period_days = max(500, 380 + int(scan_days * 1.5))
+    print(f"  📡 Fetching SPY + VIX + MOVE from Yahoo Finance ({period_days}d)...")
     end = pd.Timestamp.today() + pd.Timedelta(days=1)
     start = end - pd.Timedelta(days=period_days)
-    spy = yf.download("SPY",  start=start, end=end, progress=False, auto_adjust=False)
-    vix = yf.download("^VIX", start=start, end=end, progress=False, auto_adjust=False)
+    spy  = yf.download("SPY",   start=start, end=end, progress=False, auto_adjust=False)
+    vix  = yf.download("^VIX",  start=start, end=end, progress=False, auto_adjust=False)
+    move = yf.download("^MOVE", start=start, end=end, progress=False, auto_adjust=False)
     if spy.empty or vix.empty:
-        sys.exit("❌ Yahoo returned empty data")
-    if isinstance(spy.columns, pd.MultiIndex):
-        spy.columns = spy.columns.get_level_values(0)
-    if isinstance(vix.columns, pd.MultiIndex):
-        vix.columns = vix.columns.get_level_values(0)
-    df = pd.DataFrame({
+        sys.exit("❌ Yahoo returned empty data for SPY/VIX")
+    for d in (spy, vix, move):
+        if not d.empty and isinstance(d.columns, pd.MultiIndex):
+            d.columns = d.columns.get_level_values(0)
+    cols = {
         "SPY": spy["Close"].astype(float),
         "VIX": vix["Close"].astype(float),
-    }).dropna()
+    }
+    if not move.empty and "Close" in move.columns:
+        cols["MOVE"] = move["Close"].astype(float)
+    df = pd.DataFrame(cols).dropna(subset=["SPY", "VIX"])
     df.index = pd.to_datetime(df.index)
-    print(f"     Got {len(df)} trading days  •  last close: {df.index[-1].date()}")
+    move_str = (f"MOVE {df['MOVE'].iloc[-1]:.1f}"
+                if "MOVE" in df.columns else "MOVE n/a")
+    print(f"     Got {len(df)} trading days  •  last close: {df.index[-1].date()}  •  {move_str}")
     return df
 
 
@@ -288,6 +468,63 @@ def explain_rule(key: str, row, sigs_row) -> tuple[bool, list[str]]:
         ]
         return all([c1, c2, c3]), conds
 
+    if key == "L_OVERSOLD_DEEP":
+        c1 = row["RSI14"] < 30
+        c2 = bool(row["spy_above_200"])
+        c3 = vix < 28
+        conds = [
+            cv("RSI < 30 (deep oversold)", c1, f"RSI {row['RSI14']:.1f}"),
+            cv("SPY > 200DMA",             c2, f"200DMA ${row['sma200']:.0f}"),
+            cv("VIX < 28",                 c3, f"VIX {vix:.1f}"),
+        ]
+        return all([c1, c2, c3]), conds
+
+    if key == "M_BB_TIGHT":
+        c1 = row["bb_width_pct"] < 0.15
+        c2 = spy >= row["bb_upper"]
+        c3 = bool(row["spy_above_200"])
+        c4 = vix < 18
+        conds = [
+            cv("BB width <15th %ile",  c1, f"width %ile {row['bb_width_pct']*100:.0f}%"),
+            cv("SPY ≥ upper band",     c2, f"SPY ${spy:.0f} vs upper ${row['bb_upper']:.0f}"),
+            cv("SPY > 200DMA",         c3, f"200DMA ${row['sma200']:.0f}"),
+            cv("VIX < 18",             c4, f"VIX {vix:.1f}"),
+        ]
+        return all([c1, c2, c3, c4]), conds
+
+    if key == "N_A_GRID_VIX14_RSI65":
+        c1 = vix < 14
+        c2 = 40 <= row["RSI14"] <= 65
+        c3 = bool(row["spy_above_50"])
+        c4 = bool(row["spy_above_200"])
+        conds = [
+            cv("VIX < 14",             c1, f"VIX {vix:.1f}"),
+            cv("RSI between 40 and 65", c2, f"RSI {row['RSI14']:.1f}"),
+            cv("SPY > 50DMA",          c3, f"50DMA ${row['sma50']:.0f}"),
+            cv("SPY > 200DMA",         c4, f"200DMA ${row['sma200']:.0f}"),
+        ]
+        return all([c1, c2, c3, c4]), conds
+
+    if key == "K_FEAR_UNWIND":
+        move    = row.get("MOVE", float("nan"))
+        crush   = row.get("move_crush", float("nan"))
+        falling = bool(row.get("move_falling", False))
+        if pd.isna(move):
+            return False, [cv("MOVE data available", False, "Yahoo did not return ^MOVE today")]
+        c1 = crush >= 0.20 if pd.notna(crush) else False
+        c2 = falling
+        c3 = bool(row["spy_above_200"])
+        c4 = vix < 30
+        conds = [
+            cv("MOVE crushed ≥20% in 10d", c1,
+               f"crush {crush*100:.0f}%  (MOVE {move:.1f} vs 10d max {row.get('move_max10', float('nan')):.1f})"),
+            cv("MOVE falling 5d (slope<-5)", c2,
+               f"slope5 {row.get('move_slope5', float('nan')):+.1f}"),
+            cv("SPY > 200DMA",             c3, f"200DMA ${row['sma200']:.0f}"),
+            cv("VIX < 30",                 c4, f"VIX {vix:.1f}"),
+        ]
+        return all([c1, c2, c3, c4]), conds
+
     return False, ["(unknown rule)"]
 
 
@@ -321,19 +558,6 @@ def suggest_contract(spy: float, vix: float, otm_pct: float) -> dict:
 
 # ─── Reporting & Notification ────────────────────────────────────────────────
 
-def load_debounce_state() -> dict:
-    """Last-fire date per strategy, so we don't re-email during a streak."""
-    if DEBOUNCE_STATE_PATH.exists():
-        try:
-            return json.loads(DEBOUNCE_STATE_PATH.read_text())
-        except Exception:
-            pass
-    return {}
-
-
-def save_debounce_state(state: dict):
-    DEBOUNCE_STATE_PATH.write_text(json.dumps(state, default=str))
-
 
 def build_report(df: pd.DataFrame, otm_pct: float, mode: str = "DEBOUNCED",
                  scan_days: int = 0) -> dict:
@@ -342,7 +566,18 @@ def build_report(df: pd.DataFrame, otm_pct: float, mode: str = "DEBOUNCED",
     If `scan_days > 0`, also replay the past `scan_days` trading days and
     attach a `history` entry so HIGH-CONVICTION days are visible alongside
     today's fires.
+
+    Modes
+    -----
+    DEBOUNCED / RAW / FREQUENT
+                No per-strategy debounce: **every** strategy that passes its
+                gates today counts toward `fresh_fires` and tiers.  DEBOUNCED
+                emails when ≥1 strategy fires; RAW and FREQUENT behave the same
+                (FREQUENT is an alias for clearer cron naming).
+    HIGH_CONVICTION
+                Email only when ≥3 strategies fire the same day.
     """
+    eff_mode = "RAW" if mode == "FREQUENT" else mode
     feats = extend_features(df)
     sigs  = signals_in_window(feats, 1)
     today = feats.index[-1]
@@ -351,59 +586,63 @@ def build_report(df: pd.DataFrame, otm_pct: float, mode: str = "DEBOUNCED",
 
     spy = float(row["SPY"])
     vix = float(row["VIX"])
-
-    debounce_state = load_debounce_state() if mode == "DEBOUNCED" else {}
     today_ts = today
 
     fires = []
-    fresh_fires = []   # strategies that are FRESH (not within DEBOUNCE_DAYS of last fire)
+    fresh_fires: list[str] = []   # strategies whose conditions are TRUE today
     for s in STRATEGIES:
         fired, conds = explain_rule(s.key, row, sigs_row)
-        is_fresh = True
-        if fired and mode == "DEBOUNCED":
-            last = debounce_state.get(s.key)
-            if last:
-                last_dt = pd.Timestamp(last)
-                if (today_ts - last_dt).days < DEBOUNCE_DAYS:
-                    is_fresh = False
+        is_fresh = bool(fired)
+        edge10, win_r, fq = strategy_display_metrics(s)
         fires.append({
-            "key": s.key, "fired": fired, "freq": s.freq_yr,
-            "win_rate": s.win_rate, "edge_10yr": s.edge_10yr,
+            "key": s.key, "fired": fired, "freq": fq,
+            "win_rate": win_r, "edge_10yr": edge10,
             "layman": s.layman, "conds": conds,
-            "is_fresh": fired and is_fresh,
+            "is_fresh": is_fresh,
+            "sweep_rule": s.sweep_rule,
         })
-        if fired and is_fresh:
+        if fired:
             fresh_fires.append(s.key)
 
     contract = suggest_contract(spy, vix, otm_pct)
 
-    # In DEBOUNCED mode we only notify if at least one FRESH fire happened.
-    # In RAW mode we notify on any fire.  In HIGH_CONVICTION we need ≥3 fresh fires.
     n_fires = sum(1 for f in fires if f["fired"])
     n_fresh = len(fresh_fires)
 
-    if mode == "RAW":
+    if eff_mode == "RAW":
         any_actionable = n_fires > 0
-    elif mode == "HIGH_CONVICTION":
+    elif eff_mode == "HIGH_CONVICTION":
         any_actionable = n_fresh >= HIGH_CONVICTION_FRESH
-    else:  # DEBOUNCED
+    else:  # DEBOUNCED — same gate as RAW (no debounce); name kept for CLI compat
         any_actionable = n_fresh > 0
 
     is_high_conviction = n_fresh >= HIGH_CONVICTION_FRESH
-    # Super-HC = HC + the anchor strategy is among the fresh fires (or, in
-    # RAW mode, among today's fires).  Per back-test this jumps win rate
-    # +4pp and shrinks worst-case loss from -67% to -37%.
-    consider_fires = fresh_fires if mode != "RAW" else [f["key"] for f in fires if f["fired"]]
-    is_super_high_conviction = (is_high_conviction
-                                and SUPER_HC_ANCHOR in consider_fires)
+    cf_set = set(fresh_fires)
+
+    # Tier ladder (highest wins in subject line / verdict):
+    #   ELITE          = HC + long-grid + cheap-IV anchors both fire
+    #   LONG-GRID SUPER = HC + VIX14/RSI grid only (best long-horizon heuristic)
+    #   SUPER (cheap)  = HC + A_CHEAP_IV only
+    #   HIGH CONVICTION = HC, no anchor exclusivity
+    #   STRONG         = 2 firing (not HC)
+    is_elite_conviction = is_high_conviction and (
+        ANCHOR_LONG_GRID in cf_set and SUPER_HC_ANCHOR in cf_set)
+    is_long_grid_super = (is_high_conviction and (ANCHOR_LONG_GRID in cf_set)
+                          and not is_elite_conviction)
+    is_super_high_conviction = (is_high_conviction and (SUPER_HC_ANCHOR in cf_set)
+                                and not is_elite_conviction
+                                and not is_long_grid_super)
 
     history = build_history_scan(feats, sigs, scan_days) if scan_days > 0 else None
+    sweep_scan = evaluate_sweep_today(row, sigs_row)
 
     return {
         "date": str(today.date()),
         "today_ts": today_ts,
         "mode": mode,
         "spy": spy, "vix": vix,
+        "move":         float(row["MOVE"])         if "MOVE" in row and pd.notna(row.get("MOVE")) else None,
+        "move_crush":   float(row["move_crush"])   if "move_crush" in row and pd.notna(row.get("move_crush")) else None,
         "sma50": float(row["sma50"]), "sma200": float(row["sma200"]),
         "rsi14": float(row["RSI14"]), "macd": float(row["macd"]),
         "bb_width_pct": float(row["bb_width_pct"]) * 100,
@@ -413,18 +652,22 @@ def build_report(df: pd.DataFrame, otm_pct: float, mode: str = "DEBOUNCED",
         "any_fired": n_fires > 0,
         "any_actionable": any_actionable,
         "is_high_conviction": is_high_conviction,
+        "is_strong_conviction": any_actionable and (n_fresh >= 2) and (not is_high_conviction),
+        "is_elite_conviction": is_elite_conviction,
+        "is_long_grid_super": is_long_grid_super,
         "is_super_high_conviction": is_super_high_conviction,
         "n_fires": n_fires,
         "n_fresh": n_fresh,
         "contract": contract,
         "history": history,
+        "sweep_scan": sweep_scan,
     }
 
 
 def format_text_report(r: dict) -> str:
     out = []
     out.append("═" * 72)
-    out.append(f"  SPY LEAPS — TOP 10 STRATEGY SCANNER  •  {r['date']}  •  Mode: {r['mode']}")
+    out.append(f"  SPY LEAPS — STRATEGY SCANNER  •  {r['date']}  •  Mode: {r['mode']}")
     out.append("═" * 72)
     out.append("")
     out.append("  Market state (today's metrics vs the thresholds we care about):")
@@ -444,21 +687,28 @@ def format_text_report(r: dict) -> str:
     out.append(f"  {'BB-width %ile':<18}  {bb:>9.0f}%  <20% = squeeze (low vol, breakout pending)")
     out.append("")
 
-    if r["mode"] == "DEBOUNCED":
+    if r["mode"] == "HIGH_CONVICTION":
         out.append(f"  🚦 {r['n_fires']} strategies firing  •  "
-                   f"{r['n_fresh']} are FRESH (fired ≥{DEBOUNCE_DAYS}d after last fire)")
-    elif r["mode"] == "HIGH_CONVICTION":
-        out.append(f"  🚦 {r['n_fires']} strategies firing  •  "
-                   f"{r['n_fresh']} fresh  •  need ≥3 for HIGH_CONVICTION email")
+                   f"email only when ≥{HIGH_CONVICTION_FRESH} same day (today: {r['n_fresh']})")
     else:
-        out.append(f"  🚦 {r['n_fires']} of {len(r['fires'])} strategies firing today")
+        out.append(f"  🚦 {r['n_fires']} of {len(r['fires'])} strategies firing today "
+                     f"(no debounce)")
     out.append("")
 
     if r["any_actionable"]:
         c = r["contract"]
         out.append("  " + "─" * 68)
-        if r.get("is_super_high_conviction"):
-            out.append(f"  🔥🔥 SUPER HIGH CONVICTION DAY — {r['n_fresh']} strategies agree,")
+        if r.get("is_elite_conviction"):
+            out.append(f"  🔥🔥🔥 ELITE HC — {r['n_fresh']} strategies incl. "
+                        f"{ANCHOR_LONG_GRID} + {SUPER_HC_ANCHOR} (best long-horizon grid + cheap IV)")
+            out.append(f"     → Strongest tier: consider sizing up if risk budget allows")
+            out.append("  " + "─" * 68)
+        elif r.get("is_long_grid_super"):
+            out.append(f"  🔥🔥 LONG-GRID SUPER HC — {r['n_fresh']} agree incl. {ANCHOR_LONG_GRID} "
+                        f"(VIX<14 / RSI 40–65; best 30y sweep stats)")
+            out.append("  " + "─" * 68)
+        elif r.get("is_super_high_conviction"):
+            out.append(f"  🔥🔥 SUPER HC (cheap IV) — {r['n_fresh']} strategies agree,")
             out.append(f"        anchor {SUPER_HC_ANCHOR} is among them!")
             out.append(f"     (HC + {SUPER_HC_ANCHOR} fires — past 10 yrs: ~82% win rate,")
             out.append(f"      2-yr window: 100% win rate; cheap-IV setups limit worst case)")
@@ -497,11 +747,8 @@ def format_text_report(r: dict) -> str:
     fired = sorted([f for f in r["fires"] if f["fired"]],
                    key=lambda f: -f["edge_10yr"])
     for f in fired:
-        tag = "🟢" if f["is_fresh"] else "⏸️ "
-        note = (" ✅ FRESH" if f["is_fresh"]
-                else f" (within {DEBOUNCE_DAYS}d cooldown — already alerted)")
-        out.append(f"  {tag} {f['key']:<18} ({f['freq']:.1f}/yr  •  "
-                   f"win {f['win_rate']}%  •  10yr edge ${f['edge_10yr']:+,}){note}")
+        out.append(f"  🟢 {f['key']:<18} ({f['freq']:.1f}/yr  •  "
+                   f"win {f['win_rate']}%  •  10yr edge ${f['edge_10yr']:+,})  firing today")
         out.append(f"     {f['layman']}")
         for c in f["conds"]:
             out.append(f"       {c}")
@@ -533,17 +780,18 @@ def format_text_report(r: dict) -> str:
 
 
 def format_strategy_ranking() -> str:
-    """Compact ranking table for the 10 strategies, biggest 10-yr $$ edge first."""
+    """Compact ranking table for all strategies, biggest 10-yr sweep edge first."""
     lines = []
-    lines.append("  ── STRATEGY RANKING (sorted by 10-yr after-tax edge — biggest $$ first) ──")
+    lines.append("  ── STRATEGY RANKING (10-yr after-tax edge from sweep CSV when available) ──")
     lines.append("")
     lines.append(f"     {'#':>2}  {'Strategy':<17}  {'Win%':>4}  "
                  f"{'10yr edge':>12}  {'Fires/yr':>8}  Idea")
     lines.append("     " + "─" * 100)
-    ranked = sorted(STRATEGIES, key=lambda s: -s.edge_10yr)
+    ranked = strategies_sorted_by_sweep_10y()
     for i, s in enumerate(ranked, 1):
-        lines.append(f"     {i:>2}.  {s.key:<17}  {s.win_rate:>3}%  "
-                     f"${s.edge_10yr:>+10,}  {s.freq_yr:>7.1f}  {s.layman}")
+        edge10, win_r, fq = strategy_display_metrics(s)
+        lines.append(f"     {i:>2}.  {s.key:<17}  {win_r:>3}%  "
+                     f"${edge10:>+10,}  {fq:>7.1f}  {s.layman}")
     return "\n".join(lines)
 
 
@@ -560,14 +808,22 @@ def format_history_scan(history: dict) -> str:
         lines.append(f"     ⚠️  No HIGH-CONVICTION days "
                      f"(≥{HIGH_CONVICTION_FRESH} strategies same day) in this window.")
     else:
-        lines.append(f"     🔥 {len(hc_days)} HIGH-CONVICTION day"
-                     f"{'s' if len(hc_days) != 1 else ''} "
+        n_all = len(hc_days)
+        cap = HC_HISTORY_DISPLAY_MAX
+        tail = hc_days[-cap:] if n_all > cap else hc_days
+        omitted = n_all - len(tail)
+        lines.append(f"     🔥 {n_all} HIGH-CONVICTION day"
+                     f"{'s' if n_all != 1 else ''} "
                      f"(≥{HIGH_CONVICTION_FRESH} strategies firing same day):")
+        if omitted > 0:
+            lines.append(f"        (Showing newest {len(tail)}; {omitted} older "
+                         f"day{'s' if omitted != 1 else ''} omitted — fire-count table "
+                         f"below is still for the full {history['days']}d window.)")
         lines.append("")
         lines.append(f"        {'Date':<11}  {'SPY':>7}  {'VIX':>5}  "
                      f"{'#':>2}  Strategies that agreed")
         lines.append("        " + "─" * 92)
-        for d in hc_days:
+        for d in tail:
             lines.append(f"        {d['date']:<11}  ${d['spy']:>6,.0f}  "
                          f"{d['vix']:>4.1f}  {d['n']:>2}  {', '.join(d['fired'])}")
 
@@ -640,42 +896,166 @@ def build_history_scan(feats: pd.DataFrame, sigs: pd.DataFrame,
 def format_email_report(r: dict) -> tuple[str, str]:
     """Returns (subject, body) for email — concise, action-first.
 
-    Three tiers (per the two-tier thesis + standard buy):
-      🔥🔥 SUPER HIGH CONVICTION  →  HC + the SUPER_HC_ANCHOR strategy fires
-      🔥    HIGH CONVICTION         →  ≥HIGH_CONVICTION_FRESH strategies fire
-      🟢    BUY                     →  ≥1 fresh strategy fires
-      ⚪️    no signal               →  nothing fresh
+    BUY tier ladder (best subject wins):
+      🔥🔥🔥 ELITE HC        →  ≥3 firing + VIX14/RSI grid + A_CHEAP_IV
+      🔥🔥 LONG-GRID SUPER  →  ≥3 firing + long-grid row only (best 30y stats)
+      🔥🔥 SUPER (cheap IV) →  ≥3 firing + A_CHEAP_IV only (classic SHC)
+      🔥 HIGH CONVICTION    →  ≥3 firing, no exclusive anchor combo above
+      🟡 STRONG BUY         →  2 firing (not HC)
+      🟢 BUY                →  1 firing
+      ⚪️ no signal          →  nothing actionable for this mode
     """
     if r["any_actionable"]:
-        n = r["n_fresh"] if r["mode"] != "RAW" else r["n_fires"]
-        fired_keys = ", ".join(r["fresh_fires"] if r["mode"] != "RAW"
-                               else [f["key"] for f in r["fires"] if f["fired"]])
-        if r.get("is_super_high_conviction"):
-            subject = (f"🔥🔥 SUPER HIGH CONVICTION — {n} SPY LEAPS signals "
-                       f"incl. {SUPER_HC_ANCHOR} ({fired_keys})")
+        n = r["n_fresh"]
+        fired_keys = ", ".join(r["fresh_fires"])
+        if r.get("is_elite_conviction"):
+            subject = (f"🔥🔥🔥 ELITE HC — {n} SPY LEAPS incl. "
+                       f"{ANCHOR_LONG_GRID} + {SUPER_HC_ANCHOR} ({fired_keys})")
+        elif r.get("is_long_grid_super"):
+            subject = (f"🔥🔥 LONG-GRID SUPER HC — {n} incl. {ANCHOR_LONG_GRID} "
+                       f"({fired_keys})")
+        elif r.get("is_super_high_conviction"):
+            subject = (f"🔥🔥 SUPER HC (cheap IV) — {n} incl. {SUPER_HC_ANCHOR} "
+                       f"({fired_keys})")
         elif r["is_high_conviction"]:
             subject = f"🔥 HIGH CONVICTION — {n} SPY LEAPS signals agree ({fired_keys})"
+        elif r.get("is_strong_conviction"):
+            subject = f"🟡 STRONG BUY — 2 heuristics agree ({fired_keys})"
         else:
             subject = f"🟢 SPY LEAPS — {n} signal{'s' if n != 1 else ''} firing ({fired_keys})"
     else:
-        subject = f"⚪️ SPY LEAPS — no fresh signals today ({r['date']})"
+        subject = f"⚪️ SPY LEAPS — no BUY signals today ({r['date']})"
     body = format_email_body(r)
     return subject, body
+
+
+# ─── 33-yr top-5 sweep scan (per email) ──────────────────────────────────────
+
+SWEEP_CSV   = PROJECT_DIR / "results" / "heuristics_sweep_filtered.csv"
+SWEEP_TOP_N = 5
+SWEEP_WINDOWS = [1, 2, 5, 10, 30]   # what the user asked for in the email
+
+
+def _sweep_rule_map() -> dict:
+    """Build a {rule_name: callable} lookup from heuristics_sweep.build_rules.
+
+    Cached on first call.  Returns an empty dict if heuristics_sweep is missing
+    (script still runs, just without the sweep section).
+    """
+    if hasattr(_sweep_rule_map, "_cache"):
+        return _sweep_rule_map._cache
+    try:
+        _sweep_rule_map._cache = {n: fn for n, fn, _g in _build_sweep_rules()}
+    except Exception:
+        _sweep_rule_map._cache = {}
+    return _sweep_rule_map._cache
+
+
+def evaluate_sweep_today(row, sigs_row) -> dict:
+    """For each window in SWEEP_WINDOWS, evaluate the top-N rules from the
+    filtered sweep CSV and report (rule, edge/yr, fired?).
+
+    Returns a dict {window_yr: [{name, edge_yr, fired, trd, win_rate}, ...]}.
+    """
+    out: dict[int, list[dict]] = {}
+    if not SWEEP_CSV.exists():
+        return out
+    try:
+        df = pd.read_csv(SWEEP_CSV)
+    except Exception:
+        return out
+    rule_map = _sweep_rule_map()
+    for w in SWEEP_WINDOWS:
+        sub = (df[df["window_yr"] == w]
+               .sort_values("edge_aftertax", ascending=False)
+               .head(SWEEP_TOP_N))
+        rows = []
+        for r in sub.itertuples():
+            fn = rule_map.get(r.rule)
+            try:
+                fired = bool(fn(row, sigs_row)) if fn is not None else False
+            except Exception:
+                fired = False
+            rows.append({
+                "name":     r.rule,
+                "edge_yr":  r.edge_aftertax / w,
+                "trades":   int(r.trades),
+                "trd_yr":   r.trades_per_yr,
+                "win_rate": r.win_rate,
+                "fired":    fired,
+            })
+        out[w] = rows
+    return out
+
+
+def format_sweep_scan_section(scan: dict,
+                              windows: list[int] | None = None) -> list[str]:
+    """Pretty email section listing top-5 rules per window with fire status.
+
+    ``windows`` defaults to ``SWEEP_WINDOWS``; pass ``EMAIL_SWEEP_WINDOWS`` for
+    a shorter email (long horizons only).
+    """
+    if not scan:
+        return []
+    use_w = windows if windows is not None else list(SWEEP_WINDOWS)
+    lines = []
+    lines.append("  ── 33-YR SWEEP TOP-5 (which fire today?) ──")
+    if use_w == list(SWEEP_WINDOWS):
+        lines.append("     Windows: 1 / 2 / 5 / 10 / 30 yr  •  after-tax edge $/yr vs VOO DCA")
+    else:
+        lines.append(f"     Windows: {' / '.join(str(w) for w in use_w)} yr only "
+                       f"(full ladder in `results/heuristics_sweep_filtered.csv`)")
+    lines.append("     (density-filtered ≤4 trades/yr in the CSV)")
+    any_fired = []
+    for w in use_w:
+        rows = scan.get(w, [])
+        if not rows:
+            continue
+        lines.append("")
+        lines.append(f"     {w}-YEAR WINDOW")
+        for i, rr in enumerate(rows, 1):
+            tag = "🟢" if rr["fired"] else "  "
+            lines.append(f"     {tag} #{i}  {rr['name']:<38}  "
+                         f"{rr['trd_yr']:>3.1f}/yr  "
+                         f"win {rr['win_rate']:>4.0f}%  "
+                         f"edge ${rr['edge_yr']:>+8,.0f}/yr")
+            if rr["fired"]:
+                any_fired.append((w, rr["name"]))
+    lines.append("")
+    if any_fired:
+        lines.append(f"     ⚡ {len(any_fired)} top-5 rule(s) FIRING today: "
+                     + "; ".join(f"{w}y→{n}" for w, n in any_fired))
+    else:
+        lines.append("     ⏸️  None of the sweep top-5 fire today — patient regime.")
+    return lines
+
+
+def format_email_ranking_summary(r: dict) -> list[str]:
+    """Short 10y-edge leaders for email (full sort order ≈ matrix row order)."""
+    ranked = strategies_sorted_by_sweep_10y()
+    fired_keys = {f["key"] for f in r["fires"] if f["fired"]}
+    parts: list[str] = []
+    for s in ranked[:5]:
+        edge10, wr, _ = strategy_display_metrics(s)
+        tag = " 🟢" if s.key in fired_keys else ""
+        parts.append(f"{s.key} (${edge10:+,}, {wr}%){tag}")
+    return [
+        "  ── 10y sweep edge — top 5 (🟢 = firing today; matrix T column matches) ──",
+        "     " + "  •  ".join(parts),
+    ]
 
 
 def format_email_body(r: dict) -> str:
     """Concise email body — only what's needed to act today.
 
     Layout:
-      1. Verdict line + market snapshot (compact)
-      2. Action block (contract + 5-step execution) if any_actionable
-      3. Fired strategies with reasons (just the failed/passed conditions)
-      4. Strategy ranking (10-line table)
-      5. Footer with usage hints
-
-    The 5-year HIGH-CONVICTION scan is still computed for the console
-    report (`--force` to see it) but intentionally omitted from the email
-    to keep the message tight.
+      1. Verdict + market snapshot
+      2. Win-% matrix (1y–30y) + T markers + HC / Super-HC hint
+      3. Action block if any_actionable
+      4. Fired strategies with condition breakdown (WHY)
+      5. One-line 10y-edge top-5 (full table lives in the matrix above)
+      6. Sweep top-5 for long windows only
+      7. SELL block (if any indication) + footer
     """
     out: list[str] = []
     out.append("═" * 72)
@@ -684,19 +1064,30 @@ def format_email_body(r: dict) -> str:
     out.append("")
 
     # ── 1. Verdict + market snapshot ─────────────────────────────────────────
-    if r.get("is_super_high_conviction"):
-        verdict = (f"🔥🔥 SUPER HIGH CONVICTION BUY — {r['n_fresh']} strategies "
-                   f"agree (incl. anchor {SUPER_HC_ANCHOR})")
+    if r.get("is_elite_conviction"):
+        verdict = (f"🔥🔥🔥 ELITE HC BUY — {r['n_fresh']} agree "
+                   f"({ANCHOR_LONG_GRID} + {SUPER_HC_ANCHOR})")
+    elif r.get("is_long_grid_super"):
+        verdict = (f"🔥🔥 LONG-GRID SUPER HC — {r['n_fresh']} agree "
+                   f"(incl. {ANCHOR_LONG_GRID})")
+    elif r.get("is_super_high_conviction"):
+        verdict = (f"🔥🔥 SUPER HC (cheap IV) — {r['n_fresh']} incl. {SUPER_HC_ANCHOR}")
     elif r["is_high_conviction"]:
         verdict = f"🔥 HIGH CONVICTION BUY — {r['n_fresh']} strategies agree"
+    elif r.get("is_strong_conviction"):
+        verdict = (f"🟡 STRONG BUY — 2 heuristics agree "
+                   f"({', '.join(r['fresh_fires'])})")
     elif r["any_actionable"]:
-        verdict = f"🟢 BUY — {r['n_fresh']} fresh signal{'s' if r['n_fresh'] != 1 else ''} firing"
+        verdict = f"🟢 BUY — {r['n_fresh']} heuristic{'s' if r['n_fresh'] != 1 else ''} firing"
     else:
-        verdict = "⚪️ NO ACTION — no fresh buy signals today"
+        verdict = "⚪️ NO ACTION — no buy signals for this notification mode"
     out.append(f"  {verdict}")
-    out.append(f"  SPY ${r['spy']:.2f}  •  VIX {r['vix']:.1f}  •  "
+    move_str = f"  •  MOVE {r['move']:.1f}" if r.get("move") is not None else ""
+    out.append(f"  SPY ${r['spy']:.2f}  •  VIX {r['vix']:.1f}{move_str}  •  "
                f"RSI {r['rsi14']:.0f}  •  50DMA ${r['sma50']:.0f}  •  "
                f"200DMA ${r['sma200']:.0f}  •  DD {r['drawdown']:+.1f}%")
+    out.append("")
+    out.extend(format_win_rate_matrix_lines(r))
     out.append("")
 
     # ── 2. Action block (only when actionable) ───────────────────────────────
@@ -730,36 +1121,34 @@ def format_email_body(r: dict) -> str:
     if fired:
         out.append(f"  ── WHY ({len(fired)} firing) ──")
         for f in fired:
-            tag = "🟢" if f["is_fresh"] else "⏸️ "
-            tail = " (FRESH)" if f["is_fresh"] else f" (within {DEBOUNCE_DAYS}d cooldown)"
-            out.append(f"  {tag} {f['key']:<17} "
-                       f"win {f['win_rate']}%, 10yr edge ${f['edge_10yr']:+,}{tail}")
+            out.append(f"  🟢 {f['key']:<22} "
+                       f"win {f['win_rate']}%, 10yr edge ${f['edge_10yr']:+,}  (firing)")
             out.append(f"     {f['layman']}")
             for c in f["conds"]:
                 out.append(f"       {c}")
         out.append("")
 
-    # ── 4. Strategy ranking (always) ─────────────────────────────────────────
-    out.append("  ── STRATEGY RANKING (10-yr after-tax edge, biggest $$ first) ──")
-    ranked = sorted(STRATEGIES, key=lambda s: -s.edge_10yr)
-    fired_keys = {f["key"] for f in r["fires"] if f["fired"]}
-    for i, s in enumerate(ranked, 1):
-        flag = "🟢" if s.key in fired_keys else "  "
-        out.append(f"     {flag} {i:>2}. {s.key:<17}  win {s.win_rate}%  "
-                   f"10yr ${s.edge_10yr:>+9,}  ({s.freq_yr:.1f}/yr)")
+    # ── 4. 10y leaders (one line; full ranking is implicit in matrix row order) ─
+    out.extend(format_email_ranking_summary(r))
     out.append("")
 
-    # ── 5. SELL-side block (only if there is ANY sell indication today) ──────
+    # ── 5. 33-yr sweep top-5 — long windows only in email ────────────────────
+    sweep_scan = r.get("sweep_scan") or {}
+    if sweep_scan:
+        out.extend(format_sweep_scan_section(sweep_scan, windows=EMAIL_SWEEP_WINDOWS))
+        out.append("")
+
+    # ── 6. SELL-side block (only if there is ANY sell indication today) ──────
     # Skip entirely on quiet HOLD days so the email stays BUY-focused.
     sell = r.get("sell")
     if sell and _has_sell_indication(sell):
         out.append(format_sell_email_section(sell))
         out.append("")
 
-    # ── 6. Footer ────────────────────────────────────────────────────────────
+    # ── 7. Footer ────────────────────────────────────────────────────────────
     out.append("─" * 72)
     out.append("  Run `python final_leaps/daily_signal_top10.py --force` for full")
-    out.append("  diagnostics (all 10 strategies' condition breakdowns + 5-yr scan).")
+    out.append("  diagnostics (all strategies' condition breakdowns + 5-yr scan).")
     out.append("─" * 72)
     return "\n".join(out)
 
@@ -862,10 +1251,16 @@ def main():
                         help="Don't send notification, just print + log")
     parser.add_argument("--otm",   type=float, default=DEFAULT_OTM,
                         help="OTM percentage for suggested contract (default 0.15)")
-    parser.add_argument("--mode",  choices=["RAW", "DEBOUNCED", "HIGH_CONVICTION"],
+    parser.add_argument("--mode",  choices=["RAW", "FREQUENT", "DEBOUNCED", "HIGH_CONVICTION"],
                         default="DEBOUNCED",
-                        help="Notification filter mode (default DEBOUNCED, ~43 emails/yr; "
-                             "RAW ~151/yr, HIGH_CONVICTION ~10/yr)")
+                        help="BUY gate: DEBOUNCED or RAW/FREQUENT = email when ≥1 strategy fires "
+                             "(no debounce; ~150+ sessions/yr). HIGH_CONVICTION = ≥3 firing (~24/yr).")
+    parser.add_argument("--repeat-daily", action="store_true",
+                        help="Allow more than one notification per calendar day "
+                             "(skips .last_notified date de-dupe; use with FREQUENT for intraday)")
+    parser.add_argument("--reset-notify-state", action="store_true",
+                        help="Delete .last_notified_top10.json before running so a normal run "
+                             "can email again (same as removing that file by hand).")
     parser.add_argument("--scan",  type=int, default=DEFAULT_SCAN_DAYS,
                         help=f"Scan past N trading days for HIGH-CONVICTION days "
                              f"(default {DEFAULT_SCAN_DAYS}; pass 0 to disable)")
@@ -873,6 +1268,11 @@ def main():
                         help="Skip the SELL-side scanner (default: both BUY and SELL "
                              "are run + combined into a single email)")
     args = parser.parse_args()
+
+    if args.reset_notify_state and LAST_NOTIFIED_PATH.exists():
+        LAST_NOTIFIED_PATH.unlink()
+        print(f"  🗑  Cleared notify state ({LAST_NOTIFIED_PATH.name}) — next send is not "
+              f"blocked by prior same-day delivery.\n")
 
     df = fetch_data(scan_days=args.scan)
 
@@ -888,7 +1288,7 @@ def main():
         # Also print sell-side console output for parity with the old workflow
         try:
             from sell_signals.daily_sell_check import format_text as _ft
-            sell_console = _ft(sell_report)
+            sell_console = _ft(sell_report, compact=True)
         except Exception:
             sell_console = ""
     else:
@@ -904,29 +1304,35 @@ def main():
     sell_actionable = (sell_report is not None
                        and sell_report["verdict"] in ("SELL", "WATCH"))
     should_send = (buy_actionable or sell_actionable or args.force) and not args.quiet
-    if should_send and (args.force or should_notify_again(report)):
+    if should_send and (args.force or args.repeat_daily or should_notify_again(report)):
         subject = _combined_subject(report, sell_report)
         body    = format_email_body(report)
         short_msg = _combined_short_msg(report, sell_report)
-        priority = 1 if (buy_actionable or sell_actionable) else 0
-        notify_all(
+        priority = 0
+        if buy_actionable or sell_actionable:
+            priority = 1
+        if buy_actionable and (report.get("is_elite_conviction")
+                               or report.get("is_long_grid_super")):
+            priority = 2
+        n_strat = len(STRATEGIES)
+        sent = notify_all(
             title=subject,
             message=short_msg,                          # for macOS/Pushover (short)
             body=body,                                  # full detailed email body
-            subtitle=f"{report['date']}  •  {report['n_fresh']}/10 fresh",
+            subtitle=f"{report['date']}  •  {report['n_fresh']}/{n_strat} firing",
             priority=priority,
         )
-        if buy_actionable:
+        delivery_ok = any(sent.values())
+        if not delivery_ok:
+            print("  ⚠️  No notification channel succeeded (check SMTP_USER/SMTP_PASS "
+                  "in env or ~/.leaps_signal_config.json, or Pushover/macOS). "
+                  "State not saved — next run will retry.")
+        elif buy_actionable:
             remember_notification(report)
-            if report["mode"] == "DEBOUNCED":
-                state = load_debounce_state()
-                for k in report["fresh_fires"]:
-                    state[k] = report["date"]
-                save_debounce_state(state)
-    elif (buy_actionable or sell_actionable) and not args.force:
-        print("  ℹ️  Already notified for this date.")
     elif args.quiet:
         print("  🔇 Quiet mode — no notification.")
+    elif (buy_actionable or sell_actionable) and not args.force:
+        print("  ℹ️  Already notified for this date.")
     else:
         print("  ℹ️  No BUY or SELL signals firing — no notification sent.")
 
@@ -937,13 +1343,18 @@ def _combined_subject(r: dict, sell: dict | None) -> str:
     """Build one subject line that summarizes both BUY and SELL state."""
     buy_part = ""
     if r["any_actionable"]:
-        keys = ", ".join(r["fresh_fires"] if r["mode"] != "RAW"
-                         else [f["key"] for f in r["fires"] if f["fired"]])
-        n = r["n_fresh"] if r["mode"] != "RAW" else r["n_fires"]
-        if r.get("is_super_high_conviction"):
+        keys = ", ".join(r["fresh_fires"])
+        n = r["n_fresh"]
+        if r.get("is_elite_conviction"):
+            flame = "🔥🔥🔥 ELITE "
+        elif r.get("is_long_grid_super"):
+            flame = "🔥🔥 LG "
+        elif r.get("is_super_high_conviction"):
             flame = "🔥🔥 SHC "
         elif r["is_high_conviction"]:
             flame = "🔥 HC "
+        elif r.get("is_strong_conviction"):
+            flame = "🟡 STRONG "
         else:
             flame = "🟢 "
         buy_part = f"{flame}BUY × {n} ({keys})"
@@ -964,20 +1375,27 @@ def _combined_subject(r: dict, sell: dict | None) -> str:
 def _combined_short_msg(r: dict, sell: dict | None) -> str:
     """Short-form summary used for macOS toasts / Pushover (length-limited)."""
     if r["any_actionable"]:
-        if r.get("is_super_high_conviction"):
-            tier = "🔥🔥 SHC"
+        if r.get("is_elite_conviction"):
+            tier = "🔥🔥🔥 ELITE"
+        elif r.get("is_long_grid_super"):
+            tier = "🔥🔥 LG-SUPER"
+        elif r.get("is_super_high_conviction"):
+            tier = "🔥🔥 SHC-IV"
         elif r["is_high_conviction"]:
             tier = "🔥 HC"
+        elif r.get("is_strong_conviction"):
+            tier = "🟡 STRONG"
         else:
             tier = "🟢"
-        buy = (f"{tier} {r['n_fresh']} fresh BUY  •  "
+        nf = r["n_fresh"]
+        buy = (f"{tier} {nf} firing  •  "
                f"SPY ${r['spy']:.0f}  VIX {r['vix']:.1f}\n"
                f"Buy: SPY ${r['contract']['strike']:.0f} "
                f"{r['contract']['expiry']} call @ "
                f"${r['contract']['premium_mid']:.2f}/sh "
                f"(~${r['contract']['cost']:.0f}/cntrct)")
     else:
-        buy = (f"SPY ${r['spy']:.0f}  VIX {r['vix']:.1f}  — no fresh BUY signals.")
+        buy = (f"SPY ${r['spy']:.0f}  VIX {r['vix']:.1f}  — no BUY signals for this mode.")
     if not _has_sell_indication(sell):
         return buy
     sell_line = (f"SELL: {sell['verdict']}  "
