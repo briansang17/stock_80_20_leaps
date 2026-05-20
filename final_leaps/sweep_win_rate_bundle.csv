@@ -4,6 +4,11 @@ A_grid.VIX<14.RSI<65,2,80
 A_grid.VIX<14.RSI<65,5,93
 A_grid.VIX<14.RSI<65,10,80
 A_grid.VIX<14.RSI<65,30,70
+A_grid.VIX<16.RSI<70,1,90
+A_grid.VIX<16.RSI<70,2,78
+A_grid.VIX<16.RSI<70,5,82
+A_grid.VIX<16.RSI<70,10,78
+A_grid.VIX<16.RSI<70,30,62
 move.fear_unwind,1,100
 move.fear_unwind,2,100
 move.fear_unwind,5,73

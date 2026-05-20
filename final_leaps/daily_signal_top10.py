@@ -1057,6 +1057,132 @@ def format_sweep_scan_section(scan: dict,
     return lines
 
 
+def _sweep_wr_pct(rule: str, window_yr: int) -> str:
+    """Win % string for a sweep rule and look-back window, or em-dash."""
+    wr = sweep_win_by_window().get(rule, {}).get(window_yr)
+    return f"{wr}%" if wr is not None else "—"
+
+
+def _fit_tag(ok: bool, close: bool = False) -> str:
+    """✅ in band, 🟡 close, ❌ out of band."""
+    if ok:
+        return "✅"
+    return "🟡" if close else "❌"
+
+
+def format_email_market_guide(r: dict) -> list[str]:
+    """Plain-English snapshot + how today lines up with top cheap-IV heuristics."""
+    spy = r["spy"]
+    vix = r["vix"]
+    rsi = r["rsi14"]
+    sma50 = r["sma50"]
+    sma200 = r["sma200"]
+    dd = r["drawdown"]
+    move = r.get("move")
+    above50 = spy > sma50
+    above200 = spy > sma200
+    pct50 = (spy / sma50 - 1) * 100 if sma50 else 0.0
+    pct200 = (spy / sma200 - 1) * 100 if sma200 else 0.0
+
+    # A_CHEAP_IV: VIX<16, RSI 40–65, SPY>50 & 200 DMA
+    cheap_vix = vix < 16
+    cheap_vix_close = vix < 18
+    cheap_rsi = 40 <= rsi <= 65
+    cheap_rsi_close = 40 <= rsi <= 70
+    cheap_trend = above50 and above200
+
+    # Sweep winner A_grid.VIX<16.RSI<70 (same trend gates, VIX<16, RSI 40–70)
+    grid_vix = vix < 16
+    grid_vix_close = vix < 18
+    grid_rsi = 40 <= rsi <= 70
+    grid_trend = above50 and above200
+
+    # Long-grid anchor N_A_GRID_VIX14_RSI65 (stricter VIX<14, RSI 40–65)
+    lg_vix = vix < 14
+    lg_vix_close = vix < 16
+    lg_rsi = cheap_rsi
+    lg_trend = cheap_trend
+
+    lines: list[str] = []
+    lines.append("  ── TODAY'S TAPE — what the numbers mean vs top cheap-IV rules ──")
+    lines.append("")
+    lines.append("  Glossary (each appears in the header line above):")
+    lines.append("     SPY      = S&P 500 ETF price (what we buy LEAPS on).")
+    lines.append("     VIX      = equity fear / implied-vol index; LOWER often means")
+    lines.append("              cheaper call options (calm market).")
+    lines.append("     MOVE     = bond-market volatility (ICE index); calm <90, normal")
+    lines.append("              ~90–110, stressed >120 (optional filter on some rules).")
+    lines.append("     RSI      = 14-day momentum 0–100; ~50 neutral, <35 oversold,")
+    lines.append("              >70 overbought.  Cheap-IV entries want a MID band (not")
+    lines.append("              too cold, not too hot).")
+    lines.append("     50DMA    = 50-day average price; SPY above it = medium-term uptrend.")
+    lines.append("     200DMA   = 200-day average; SPY above it = long-term bull regime.")
+    lines.append("     DD       = drawdown from SPY's recent peak; 0% = at highs,")
+    lines.append("              negative = % below peak (e.g. -5% = 5% off the top).")
+    lines.append("")
+    lines.append("  Top historical winners (33-yr sweep vs VOO DCA, after-tax):")
+    wr_cheap_10 = _sweep_wr_pct("orig.C_CHEAP_IV", 10)
+    wr_cheap_30 = _sweep_wr_pct("orig.C_CHEAP_IV", 30)
+    wr_grid_10 = _sweep_wr_pct("A_grid.VIX<16.RSI<70", 10)
+    wr_grid_30 = _sweep_wr_pct("A_grid.VIX<16.RSI<70", 30)
+    wr_lg_10 = _sweep_wr_pct("A_grid.VIX<14.RSI<65", 10)
+    wr_lg_30 = _sweep_wr_pct("A_grid.VIX<14.RSI<65", 30)
+    lines.append(f"     • A_CHEAP_IV (classic cheap IV)     win {wr_cheap_10} (10y)  "
+                 f"{wr_cheap_30} (30y)  — needs VIX<16, RSI 40–65, uptrend")
+    lines.append(f"     • A_grid VIX<16 / RSI<70 (sweep)  win {wr_grid_10} (10y)  "
+                 f"{wr_grid_30} (30y)  — VIX<16, RSI 40–70, uptrend")
+    lines.append(f"     • {ANCHOR_LONG_GRID} (long-grid)   win {wr_lg_10} (10y)  "
+                 f"{wr_lg_30} (30y)  — stricter: VIX<14, RSI 40–65, uptrend")
+    lines.append("")
+    lines.append(f"     {'Metric':<9} {'Today':>12}  {'Ideal (cheap IV)':<22}  "
+                 f"{'CHEAP_IV':^8}  {'V16/R70':^8}  {'LG grid':^8}")
+    lines.append("     " + "─" * 68)
+
+    def row(label: str, today_s: str, ideal: str, c_ok: bool, c_close: bool,
+            g_ok: bool, g_close: bool, lg_ok: bool, lg_close: bool) -> str:
+        return (f"     {label:<9} {today_s:>12}  {ideal:<22}  "
+                f"{_fit_tag(c_ok, c_close):^8}  {_fit_tag(g_ok, g_close):^8}  "
+                f"{_fit_tag(lg_ok, lg_close):^8}")
+
+    lines.append(row("VIX", f"{vix:.1f}", "<16 (calm)", cheap_vix, cheap_vix_close,
+                     grid_vix, grid_vix_close, lg_vix, lg_vix_close))
+    lines.append(row("RSI", f"{rsi:.0f}", "40–65 / 40–70",
+                     cheap_rsi, cheap_rsi_close and not cheap_rsi,
+                     grid_rsi, False, lg_rsi, cheap_rsi_close and not lg_rsi))
+    lines.append(row("50DMA", f"{pct50:+.1f}%", "SPY above",
+                     above50, False, above50, False, above50, False))
+    lines.append(row("200DMA", f"{pct200:+.1f}%", "SPY above",
+                     above200, False, above200, False, above200, False))
+    lines.append(row("DD", f"{dd:+.1f}%", "not crashing",
+                     dd > -10, dd > -15, dd > -10, dd > -15, dd > -10, dd > -15))
+
+    if move is not None:
+        move_ok_calm = move < 100
+        move_close = move < 110
+        lines.append(row("MOVE", f"{move:.1f}", "<90–100 calm",
+                         move_ok_calm, move_close, move_ok_calm, move_close,
+                         move_ok_calm, move_close))
+    else:
+        lines.append(f"     {'MOVE':<9} {'n/a':>12}  {'(no data today)':<22}")
+
+    lines.append("")
+    lines.append("     ✅ = in the rule's preferred band today   "
+                 "🟡 = close   ❌ = outside")
+    n_ok_cheap = sum([cheap_vix, cheap_rsi, cheap_trend])
+    n_ok_grid = sum([grid_vix, grid_rsi, grid_trend])
+    lines.append(f"     Today vs A_CHEAP_IV gates: {n_ok_cheap}/3 core checks pass "
+                 f"(VIX, RSI band, both DMAs).")
+    lines.append(f"     Today vs A_grid VIX<16 RSI<70: {n_ok_grid}/3 pass "
+                 f"(wider RSI ceiling than CHEAP_IV).")
+    if vix >= 16 and vix < 18:
+        lines.append(f"     Note: VIX {vix:.1f} is just above the <16 cheap-IV line — "
+                     f"options are slightly pricier than the best historical entries.")
+    if rsi > 65 and rsi <= 70:
+        lines.append(f"     Note: RSI {rsi:.0f} is above CHEAP_IV's 65 cap but still "
+                     f"inside the V16/R70 sweep band.")
+    return lines
+
+
 def format_email_ranking_summary(r: dict) -> list[str]:
     """Short 10y-edge leaders for email (full sort order ≈ matrix row order)."""
     ranked = strategies_sorted_by_sweep_10y()
@@ -1076,7 +1202,7 @@ def format_email_body(r: dict) -> str:
     """Concise email body — only what's needed to act today.
 
     Layout:
-      1. Verdict + market snapshot
+      1. Verdict + market snapshot + metric glossary / top-winner bands
       2. Win-% matrix (1y–30y) + T markers + HC / Super-HC hint
       3. Action block if any_actionable
       4. Fired strategies with condition breakdown (WHY)
@@ -1113,6 +1239,8 @@ def format_email_body(r: dict) -> str:
     out.append(f"  SPY ${r['spy']:.2f}  •  VIX {r['vix']:.1f}{move_str}  •  "
                f"RSI {r['rsi14']:.0f}  •  50DMA ${r['sma50']:.0f}  •  "
                f"200DMA ${r['sma200']:.0f}  •  DD {r['drawdown']:+.1f}%")
+    out.append("")
+    out.extend(format_email_market_guide(r))
     out.append("")
     out.extend(format_win_rate_matrix_lines(r))
     out.append("")
