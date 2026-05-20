@@ -101,6 +101,8 @@ if str(PROJECT_DIR.parent) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR.parent))
 LOG_PATH = PROJECT_DIR / "results" / "daily_top10_log.csv"
 LAST_NOTIFIED_PATH = PROJECT_DIR / ".last_notified_top10.json"
+# Written when SMTP/Pushover/macOS delivery succeeds (GitHub Actions reads this).
+NOTIFICATION_SENT_MARKER = PROJECT_DIR / ".notification_sent_et"
 DEFAULT_OTM = 0.15
 HIGH_CONVICTION_FRESH = 3    # ≥3 strategies firing same day = "🔥 HIGH CONVICTION"
 # Tier anchors (see 33-yr sweep win % matrix in email):
@@ -1329,6 +1331,7 @@ def main():
     sell_actionable = (sell_report is not None
                        and sell_report["verdict"] in ("SELL", "WATCH"))
     should_send = (buy_actionable or sell_actionable or args.force) and not args.quiet
+    notification_sent = False
     if should_send and (args.force or args.repeat_daily or should_notify_again(report)):
         subject = _combined_subject(report, sell_report)
         body    = format_email_body(report)
@@ -1353,7 +1356,8 @@ def main():
                   "in env or ~/.leaps_signal_config.json, or Pushover/macOS). "
                   "State not saved — next run will retry.")
             sys.exit(1)
-        elif buy_actionable:
+        notification_sent = True
+        if buy_actionable:
             remember_notification(report)
     elif args.quiet:
         print("  🔇 Quiet mode — no notification.")
@@ -1361,6 +1365,17 @@ def main():
         print("  ℹ️  Already notified for this date.")
     else:
         print("  ℹ️  No BUY or SELL signals firing — no notification sent.")
+
+    if notification_sent:
+        # "signal" = real BUY/SELL criteria; "force" = test digest only (won't block
+        # scheduled signal email later the same ET day in GitHub Actions).
+        kind = "signal" if (buy_actionable or sell_actionable) else "force"
+        NOTIFICATION_SENT_MARKER.write_text(f"{report['date']}\n{kind}")
+        print(f"  ✅ NOTIFICATION_SENT=1  ({kind}, marker: {NOTIFICATION_SENT_MARKER.name})")
+    else:
+        if NOTIFICATION_SENT_MARKER.exists():
+            NOTIFICATION_SENT_MARKER.unlink(missing_ok=True)
+        print("  ℹ️  NOTIFICATION_SENT=0")
 
     print(f"  📝 Logged to {LOG_PATH}\n")
 

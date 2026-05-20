@@ -138,17 +138,18 @@ Caveats specific to the pre-2007 era:
 
 ## Daily automation
 
-Two free options, pick one (or both). End result: a **daily digest email at 5 pm ET** (every calendar day), including quiet days when no BUY rules fire.
+Two free options, pick one (or both). End result: **at most one signal email per ET day**, sent between **5–9 pm ET** when the usual BUY/SELL criteria pass (not a blank digest every day).
 
 ### A. GitHub Actions (recommended — runs in the cloud, zero ongoing work)
 
 `.github/workflows/daily_signal.yml` is already wired to:
 
 1. Schedule on `cron: '0 21 * * *'` and `'0 22 * * *'` (covers both EDT and EST, every day).
-2. Guard so only the run at 5 pm New-York-time actually executes (the other is skipped).
-3. Install deps from `final_leaps/requirements.txt`.
-4. Run `python final_leaps/daily_signal_top10.py --force` (always email; BUY+SELL combined).
-5. Upload `final_leaps/results/daily_top10_log.csv` as an artifact (90-day retention).
+2. **Delay-tolerant guard:** runs if the job actually starts between **5pm and 9pm ET** (GitHub often starts scheduled jobs 1–3 hours late).
+3. **Once per ET day:** cache records the date only after a **successful signal email** (not when the scan finds nothing to send).
+4. Install deps from `final_leaps/requirements.txt`.
+5. Run `python final_leaps/daily_signal_top10.py` (scheduled: signal rules only). **Run workflow** in Actions defaults to `--force` so you can test SMTP anytime; that test does not count as “already sent today” for the evening cron.
+6. Upload `final_leaps/results/daily_top10_log.csv` as an artifact (90-day retention).
 
 Add `SMTP_USER`, `SMTP_PASS`, `SMTP_TO`, `SMTP_HOST`, `SMTP_PORT` to repo *Secrets → Actions* (see `FREE_CLOUD_SETUP.md`). Done.
 

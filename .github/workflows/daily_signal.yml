@@ -2,17 +2,23 @@ name: Daily LEAPS Signal Check
 
 on:
   schedule:
-    # Fire at 21:00 and 22:00 UTC daily.  The guard step below runs the
-    # scanner only when the wall clock in New York is 5pm (17:00 ET),
-    # so one email lands at ~5pm ET year-round (EDT vs EST).
-    - cron: '0 21 * * *'   # 5pm EDT  (mid-Mar -> early Nov)
-    - cron: '0 22 * * *'   # 5pm EST  (early Nov -> mid-Mar)
-  workflow_dispatch:         # allow manual trigger from GitHub UI
+    # GitHub fires these in UTC but often STARTS the job 30–120+ minutes late.
+    - cron: '0 21 * * *'   # ≈5pm EDT  (mid-Mar -> early Nov)
+    - cron: '0 22 * * *'   # ≈5pm EST  (early Nov -> mid-Mar)
+  workflow_dispatch:
     inputs:
       force:
-        description: 'Force email even when no signals fire (scheduled runs always force)'
+        description: 'Manual test — send even when no signals fire (default ON; scheduled cron never uses this)'
         required: false
         default: 'true'
+      allow_rerun:
+        description: 'Run again even if we already sent today (ET)'
+        required: false
+        default: 'true'
+
+concurrency:
+  group: daily-leaps-signal
+  cancel-in-progress: true
 
 jobs:
   scan:
@@ -20,44 +26,82 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Skip if not 5pm in New York
+      - name: Decide whether to run (GitHub delay-safe)
         id: timecheck
         run: |
-          # Manual workflow_dispatch always runs; scheduled runs only at 5pm ET.
+          set -e
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "✅ Manual trigger — running."
+            exit 0
+          fi
+
+          HOUR_ET=$(TZ=America/New_York date +%H | sed 's/^0*//')
+          MIN_ET=$(TZ=America/New_York date +%M | sed 's/^0*//')
+          HOUR_UTC=$(date -u +%H | sed 's/^0*//')
+          echo "Scheduled cron: ${{ github.event.schedule }}"
+          echo "Job started — New York: ${HOUR_ET}:${MIN_ET}  •  UTC hour: ${HOUR_UTC}"
+
+          if [ "$HOUR_ET" -ge 17 ] && [ "$HOUR_ET" -le 21 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Within 5pm–9pm ET window — eligible to scan."
           else
-            HOUR_ET=$(TZ=America/New_York date +%H)
-            echo "Current hour in New York: $HOUR_ET"
-            if [ "$HOUR_ET" = "17" ]; then
-              echo "run=true" >> "$GITHUB_OUTPUT"
-              echo "✅ It is 5pm ET — running scanner."
-            else
-              echo "run=false" >> "$GITHUB_OUTPUT"
-              echo "⏭  Not 5pm ET — skipping (other cron will fire instead)."
-            fi
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "⏭  Outside 5pm–9pm ET (hour=${HOUR_ET}) — skipping."
+          fi
+
+      - name: Restore once-per-day state
+        if: steps.timecheck.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .gha-daily-signal-state
+          key: daily-signal-last-et-${{ runner.os }}
+          restore-keys: |
+            daily-signal-last-et-${{ runner.os }}-
+
+      - name: Skip if already sent today (ET)
+        id: dedupe
+        if: steps.timecheck.outputs.run == 'true'
+        run: |
+          TODAY_ET=$(TZ=America/New_York date +%Y-%m-%d)
+          echo "today_et=${TODAY_ET}" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ github.event.inputs.allow_rerun }}" = "true" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Manual allow_rerun — daily dedupe bypassed."
+            exit 0
+          fi
+
+          if [ -f .gha-daily-signal-state/last_run_et.txt ] && \
+             [ "$(cat .gha-daily-signal-state/last_run_et.txt)" = "$TODAY_ET" ]; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "⏭ Already sent a signal email today ($TODAY_ET) — skipping."
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ No signal email yet today ($TODAY_ET) — continuing."
           fi
 
       - name: Checkout repository
-        if: steps.timecheck.outputs.run == 'true'
+        if: steps.timecheck.outputs.run == 'true' && steps.dedupe.outputs.proceed == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
-        if: steps.timecheck.outputs.run == 'true'
+        if: steps.timecheck.outputs.run == 'true' && steps.dedupe.outputs.proceed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
-        if: steps.timecheck.outputs.run == 'true'
+        if: steps.timecheck.outputs.run == 'true' && steps.dedupe.outputs.proceed == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r final_leaps/requirements.txt
 
-      - name: Run COMBINED BUY+SELL signal scanner (daily digest email)
-        if: steps.timecheck.outputs.run == 'true'
+      - name: Run signal scanner
+        id: scanner
+        if: steps.timecheck.outputs.run == 'true' && steps.dedupe.outputs.proceed == 'true'
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
@@ -65,19 +109,53 @@ jobs:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
         run: |
-          # Always --force: email every run (market snapshot + matrix) even when
-          # no BUY/SELL rules fire.  Without this, most days send nothing.
-          ARGS="--force"
-          if [ "${{ github.event.inputs.force }}" = "false" ]; then
-            ARGS=""
+          # Scheduled: DEBOUNCED — email only when ≥1 BUY fires or SELL is WATCH/SELL.
+          # Manual (Run workflow): --force by default so you can verify SMTP anytime.
+          ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.force }}" != "false" ]; then
+              ARGS="--force"
+              echo "Using --force (manual test digest)."
+            else
+              echo "Manual run without --force (signal rules only)."
+            fi
           fi
           python final_leaps/daily_signal_top10.py $ARGS
 
+      - name: Check whether notification was sent
+        id: notify
+        if: steps.timecheck.outputs.run == 'true' && steps.dedupe.outputs.proceed == 'true' && steps.scanner.outcome == 'success'
+        run: |
+          if [ -f final_leaps/.notification_sent_et ]; then
+            KIND=$(tail -n 1 final_leaps/.notification_sent_et)
+            echo "sent=true" >> "$GITHUB_OUTPUT"
+            echo "kind=${KIND}" >> "$GITHUB_OUTPUT"
+            echo "✅ Email sent this run (kind=${KIND})."
+          else
+            echo "sent=false" >> "$GITHUB_OUTPUT"
+            echo "kind=none" >> "$GITHUB_OUTPUT"
+            echo "ℹ️  Scanner ran; no email (criteria not met or already notified)."
+          fi
+
+      - name: Record successful signal email (once per ET day)
+        if: steps.timecheck.outputs.run == 'true' && steps.dedupe.outputs.proceed == 'true' && steps.notify.outputs.sent == 'true' && steps.notify.outputs.kind == 'signal'
+        run: |
+          mkdir -p .gha-daily-signal-state
+          echo "${{ steps.dedupe.outputs.today_et }}" > .gha-daily-signal-state/last_run_et.txt
+          echo "✅ Marked ${{ steps.dedupe.outputs.today_et }} — no second email today."
+
+      - name: Save once-per-day state
+        if: steps.timecheck.outputs.run == 'true' && steps.dedupe.outputs.proceed == 'true' && steps.notify.outputs.sent == 'true' && steps.notify.outputs.kind == 'signal'
+        uses: actions/cache/save@v4
+        with:
+          path: .gha-daily-signal-state
+          key: daily-signal-last-et-${{ runner.os }}-${{ github.run_id }}
+
       - name: Upload log artifact (signal history)
-        if: steps.timecheck.outputs.run == 'true'
+        if: steps.timecheck.outputs.run == 'true' && steps.dedupe.outputs.proceed == 'true' && steps.scanner.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: daily-signal-log
+          name: daily-signal-log-${{ steps.dedupe.outputs.today_et }}
           path: final_leaps/results/daily_top10_log.csv
           retention-days: 90
           if-no-files-found: ignore
