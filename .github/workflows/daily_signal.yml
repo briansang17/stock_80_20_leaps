@@ -2,18 +2,17 @@ name: Daily LEAPS Signal Check
 
 on:
   schedule:
-    # Fire on BOTH 21:00 and 22:00 UTC Mon-Fri.  A guard step below
-    # only actually runs the scanner when the wall clock in New York
-    # is 5pm (17:00 ET).  This makes the email arrive at 5pm ET
-    # year-round (auto-handles EDT vs EST).
-    - cron: '0 21 * * 1-5'   # 5pm EDT  (mid-Mar -> early Nov)
-    - cron: '0 22 * * 1-5'   # 5pm EST  (early Nov -> mid-Mar)
+    # Fire at 21:00 and 22:00 UTC daily.  The guard step below runs the
+    # scanner only when the wall clock in New York is 5pm (17:00 ET),
+    # so one email lands at ~5pm ET year-round (EDT vs EST).
+    - cron: '0 21 * * *'   # 5pm EDT  (mid-Mar -> early Nov)
+    - cron: '0 22 * * *'   # 5pm EST  (early Nov -> mid-Mar)
   workflow_dispatch:         # allow manual trigger from GitHub UI
     inputs:
       force:
-        description: 'Force email even when no signals fire'
+        description: 'Force email even when no signals fire (scheduled runs always force)'
         required: false
-        default: 'false'
+        default: 'true'
 
 jobs:
   scan:
@@ -57,7 +56,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r final_leaps/requirements.txt
 
-      - name: Run BUY signal scanner (top-10 entry rules)
+      - name: Run COMBINED BUY+SELL signal scanner (daily digest email)
         if: steps.timecheck.outputs.run == 'true'
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -66,27 +65,13 @@ jobs:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
         run: |
-          ARGS=""
-          if [ "${{ github.event.inputs.force }}" = "true" ]; then
-            ARGS="--force"
+          # Always --force: email every run (market snapshot + matrix) even when
+          # no BUY/SELL rules fire.  Without this, most days send nothing.
+          ARGS="--force"
+          if [ "${{ github.event.inputs.force }}" = "false" ]; then
+            ARGS=""
           fi
-          # Default --scan 1260 (5y history) is built into daily_signal_top10.py
           python final_leaps/daily_signal_top10.py $ARGS
-
-      - name: Run SELL signal scanner (top-10 exit rules)
-        if: steps.timecheck.outputs.run == 'true'
-        env:
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          SMTP_TO:   ${{ secrets.SMTP_TO }}
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-        run: |
-          ARGS=""
-          if [ "${{ github.event.inputs.force }}" = "true" ]; then
-            ARGS="--force"
-          fi
-          python sell_signals/daily_sell_check.py $ARGS
 
       - name: Upload log artifact (signal history)
         if: steps.timecheck.outputs.run == 'true'

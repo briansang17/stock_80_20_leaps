@@ -1352,6 +1352,7 @@ def main():
             print("  ⚠️  No notification channel succeeded (check SMTP_USER/SMTP_PASS "
                   "in env or ~/.leaps_signal_config.json, or Pushover/macOS). "
                   "State not saved — next run will retry.")
+            sys.exit(1)
         elif buy_actionable:
             remember_notification(report)
     elif args.quiet:

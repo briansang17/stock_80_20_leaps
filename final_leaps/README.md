@@ -102,20 +102,53 @@ python final_leaps/plot_high_conviction_returns.py        # ⭐ HC-day LEAPS bac
 python final_leaps/plot_high_conviction_returns.py --years 5   # 5-year window
 ```
 
+## Long-history validation (20–30 years of real data)
+
+The canonical `data_cache/term_structure.csv` only covers 2016–2026. To stress-test the rules against the dot-com bust, GFC, COVID, and the 2022 bear, three additional scripts fetch and replay real SPY+VIX data back to **1993** (~33 years).
+
+| File | Purpose |
+|---|---|
+| `config_long_history.yaml` | All parameters in one place (date range, OTM %, exit rules, tax rates, period definitions) |
+| `fetch_long_history.py` | Downloads SPY, ^VIX, ^VIX3M, ^VIX6M from Yahoo Finance and writes `data_cache/term_structure_long.csv` (same schema as the 10-yr file) |
+| `backtest_long_history.py` | Runs all 10 strategies over the full history; reports per-decade and per-crisis after-tax edge vs pure VOO DCA |
+| `plot_long_history.py` | 33-year equity-curve PNGs per strategy (with crisis shading + edge sub-panel) |
+
+```bash
+cd final_leaps
+
+# 1. Pull 33 years of real data (one time, ~30s)
+python fetch_long_history.py
+
+# 2. Run the backtest over every period in the config
+python backtest_long_history.py
+
+# 3. Plot equity curves (one PNG per strategy + optional combined chart)
+python plot_long_history.py --combined
+
+# Common tweaks
+python backtest_long_history.py --otm 0.20                          # 20% OTM
+python backtest_long_history.py --strategies C_CHEAP_IV,D_BREAKOUT  # just these two
+python backtest_long_history.py --periods full,crisis_gfc,covid_2020
+python fetch_long_history.py --start 2000-01-01                     # shorter window
+```
+
+Caveats specific to the pre-2007 era:
+- `^VIX3M` and `^VIX6M` didn't exist before Sep 2007 / Aug 2008. The fetcher proxies 1-year IV from `^VIX` using a multiplier+offset calibrated on the 2016–2026 overlap (defaults in the YAML). This slightly overpays for LEAPS in low-vol regimes — a conservative bias for backtesting.
+- LEAPS bid-ask spreads were wider in the 90s/00s than today; the fetcher widens the modelled spread when VIX > 18 to approximate this.
+
 ## Daily automation
 
-Two free options, pick one (or both). End result: an email at 5 pm ET on every weekday only when a fresh signal fires.
+Two free options, pick one (or both). End result: a **daily digest email at 5 pm ET** (every calendar day), including quiet days when no BUY rules fire.
 
 ### A. GitHub Actions (recommended — runs in the cloud, zero ongoing work)
 
 `.github/workflows/daily_signal.yml` is already wired to:
 
-1. Schedule on `cron: '0 21 * * 1-5'` and `'0 22 * * 1-5'` (covers both EDT and EST).
+1. Schedule on `cron: '0 21 * * *'` and `'0 22 * * *'` (covers both EDT and EST, every day).
 2. Guard so only the run at 5 pm New-York-time actually executes (the other is skipped).
 3. Install deps from `final_leaps/requirements.txt`.
-4. Run `python final_leaps/daily_signal_top10.py`.
-5. Run `python sell_signals/daily_sell_check.py`.
-6. Upload `final_leaps/results/daily_top10_log.csv` as an artifact (90-day retention).
+4. Run `python final_leaps/daily_signal_top10.py --force` (always email; BUY+SELL combined).
+5. Upload `final_leaps/results/daily_top10_log.csv` as an artifact (90-day retention).
 
 Add `SMTP_USER`, `SMTP_PASS`, `SMTP_TO`, `SMTP_HOST`, `SMTP_PORT` to repo *Secrets → Actions* (see `FREE_CLOUD_SETUP.md`). Done.
 
